@@ -1,0 +1,5 @@
+(executables
+ (names sv_main)
+ (modules sv_ast sv_common sv_gen sv_main sv_parse)
+ (modules_without_implementation sv_ast)
+ (libraries str yojson unix))

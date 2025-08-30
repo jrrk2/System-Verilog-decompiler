@@ -1,177 +1,9 @@
-(* Enhanced SystemVerilog AST to Source Code Translator with Dynamic Interface Support *)
-open Yojson.Basic.Util
+open Sv_ast
+open Sv_common
 
-(* Type definitions from the TYPETABLE *)
-type sv_type =
-  | BasicType of { keyword: string; range: string option }
-  | EnumType of { name: string; items: (string * string) list }
-  | StructType of { name: string; packed: bool; members: sv_type list }
-  | RefType of { name: string; resolved: sv_type option }
-  | VoidType of { name: string; resolved: sv_type option }
-  | ArrayType of { base: sv_type; range: string }
-  | IntfRefType of { ifacename: string; modportname: string; ifacep: string; modportp: string }
-  | UnknownType of string
-
-(* Store interface reference with modport info *)
-type interface_ref = {
-  interface_name: string;
-  modport_name: string option;
-  variable_name: string;
-}
-
-(* AST node types *)
-type sv_node = 
-  | Netlist of sv_node list * (string * sv_type) list  (* nodes, type_table *)
-  | Module of {
-      name: string;
-      stmts: sv_node list;
-    }
-  | Package of {
-      name: string;
-      stmts: sv_node list;
-    }
-  | Interface of {
-      name: string;
-      params: sv_node list;
-      stmts: sv_node list;
-    }
-  | Cell of {
-      name: string;
-      modp_addr: string;
-      pins: sv_node list;
-    }
-  | Pin of {
-      name: string;
-      expr: sv_node;
-    }
-  | Modport of {
-      name: string;
-      vars: sv_node list;
-    }
-  | ModportVarRef of {
-      name: string;
-      direction: string;
-      var_ref: string;
-    }
-  | Var of {
-      name: string;
-      dtype_ref: string;
-      var_type: string;
-      direction: string;
-      value: sv_node option;
-      dtype_name: string;
-      is_param: bool;
-    }
-  | Const of {
-      name: string;
-      dtype_ref: string;
-    }
-  | Typedef of {
-      name: string;
-      dtype_ref: string;
-    }
-  | Func of {
-      name: string;
-      dtype_ref: string;
-      stmts: sv_node list;
-      vars: sv_node list;
-    }
-  | Always of {
-      always: string;
-      senses: sv_node list;
-      stmts: sv_node list;
-    }
-  | Begin of {
-      name: string;
-      stmts: sv_node list;
-      is_generate: bool;
-    }
-  | Assign of {
-      lhs: sv_node;
-      rhs: sv_node;
-      is_blocking: bool;
-    }
-  | AssignW of {
-      lhs: sv_node;
-      rhs: sv_node;
-    }
-  | If of {
-      condition: sv_node;
-      then_stmt: sv_node;
-      else_stmt: sv_node option;
-    }
-  | Case of {
-      expr: sv_node;
-      items: case_item list;
-    }
-  | While of {
-      condition: sv_node;
-      stmts: sv_node list;
-      incs: sv_node list;
-    }
-  | VarRef of {
-      name: string;
-      access: string;
-    }
-  | VarXRef of {
-      name: string;
-      access: string;
-      dotted: string;
-    }
-  | Sel of {
-      expr: sv_node;
-      lsb: sv_node option;
-      width: sv_node option;
-      range: string;
-    }
-  | ArraySel of {
-      expr: sv_node;
-      index: sv_node;
-    }
-  | FuncRef of {
-      name: string;
-      args: sv_node list;
-    }
-  | BinaryOp of {
-      op: string;
-      lhs: sv_node;
-      rhs: sv_node;
-    }
-  | UnaryOp of {
-      op: string;
-      operand: sv_node;
-    }
-  | Concat of {
-      parts: sv_node list;
-    }
-  | Cond of {
-      condition: sv_node;
-      then_val: sv_node;
-      else_val: sv_node;
-    }
-  | SenTree of sv_node list
-  | SenItem of {
-      edge_str: string;
-      signal: sv_node;
-    }
-  | CaseItem of {
-      conditions: sv_node list;
-      stmts: sv_node list;
-    }
-  | Unknown of string * string
-
-and case_item = {
-  conditions: sv_node list;
-  statements: sv_node list;
-}
-
-(* Global tables *)
-let type_table : (string, sv_type) Hashtbl.t = Hashtbl.create 100
-let interface_table : (string, sv_node) Hashtbl.t = Hashtbl.create 20
-let module_table : (string, string) Hashtbl.t = Hashtbl.create 20
-let var_table : (string, sv_node) Hashtbl.t = Hashtbl.create 20
-
-let othext = ref []
+let dump_sv_type = function
+| Some (IntfRefType {ifacename; modportname; ifacep; modportp}) -> ifacename^":"^modportname^":ifacep:modportp"
+| _ -> "unknown"
 
 (* Extract interface references from module statements *)
 let extract_interface_refs () =
@@ -179,16 +11,16 @@ let extract_interface_refs () =
   Hashtbl.iter (fun _ stmt ->
     match stmt with
     | Var { name = var_name; dtype_ref; var_type = "IFACEREF"; dtype_name } ->
-        if false then print_endline ("Extract intf: \""^var_name^"\" ref "^dtype_ref);
+        if false then print_endline ("Extract intf: \""^var_name^"\" ref "^dump_sv_type dtype_ref);
         (* Parse dtype_ref to extract interface name and modport *)
-        (match Hashtbl.find_opt type_table dtype_ref with
+        (match dtype_ref with
           | Some (IntfRefType { ifacename; modportname; ifacep; modportp }) ->
 			      if false then print_endline ifacename;
 			      let v = { interface_name = ifacename;
 			      modport_name = Some modportname;
 			      variable_name = var_name } in
 			      if not (List.mem v !acc) then acc := v :: !acc;
-	  | oth -> othext := oth :: !othext)
+	  | oth -> failwith "extract")
     | _ -> ()
   ) var_table;
   !acc
@@ -226,47 +58,6 @@ let determine_modport_for_module module_name interface_name interface_stmts =
         (function None -> List.nth multiple_modports 1 | Some mp -> mp) |> 
         Option.some
 
-(* Resolve type reference to actual type info *)
-let resolve_type dtype_ref =
-  try 
-    let resolved = Hashtbl.find type_table dtype_ref in
-    match resolved with
-    | RefType { name; _ } -> name
-    | BasicType { keyword; range = Some r; _ } -> keyword ^ " [" ^ r ^ "]"
-    | BasicType { keyword; range = None; _ } -> keyword
-    | EnumType { name; _ } -> name
-    | _ -> "logic"
-  with Not_found -> "logic"
-
-let resolve_type_with_brackets dtype_ref dtype_name =
-  (* Use dtype_name if available, otherwise resolve from type table *)
-  let base_type = if dtype_name <> "" && dtype_name <> "logic" then dtype_name else resolve_type dtype_ref in
-  (* Fix double bracket issue: logic [[7:0]] -> logic [7:0] *)
-  let fixed_type = Str.global_replace (Str.regexp "\\[\\[\\([^]]+\\)\\]\\]") "[\\1]" base_type in
-  (* Convert "logic 7:0" format to "logic [7:0]" *)
-  if String.contains fixed_type ' ' && not (String.contains fixed_type '[') then
-    let parts = String.split_on_char ' ' fixed_type in
-    match parts with
-    | [keyword; range] when String.contains range ':' -> 
-        Printf.sprintf "%s [%s]" keyword range
-    | _ -> fixed_type
-  else fixed_type
-
-(* Extract interface signals with actual interface name *)
-let extract_interface_signals interface_name interface_stmts =
-  List.fold_left (fun acc stmt ->
-    match stmt with
-    | Var { name; dtype_ref; dtype_name; var_type = "VAR"; _ } ->
-        let signal_type = resolve_type_with_brackets dtype_ref dtype_name in
-        let flattened_name = Printf.sprintf "%s_%s" interface_name name in
-        (flattened_name, signal_type, name) :: acc
-    | Var { name; dtype_ref; dtype_name; var_type = "PORT"; direction = "INPUT"; _ } ->
-        let signal_type = resolve_type_with_brackets dtype_ref dtype_name in
-        let flattened_name = Printf.sprintf "%s_%s" interface_name name in
-        (flattened_name, signal_type, name) :: acc
-    | _ -> acc
-  ) [] interface_stmts
-
 (* Get modport directions with actual modport name *)
 let get_modport_directions interface_stmts modport_name =
   let rec find_modport = function
@@ -289,9 +80,9 @@ let find_interface_by_name iface_name =
     | _ -> acc
   ) interface_table None
 
-
 (* Expand interface connections with dynamic lookup *)
-let expand_interface_connections iface_var_name module_name interface_refs =
+let expand_interface_connections iface_var_name module_name =
+  let interface_refs = extract_interface_refs () in
   (* Find the interface reference for this variable *)
   let iface_ref = List.find_opt (fun ref -> ref.variable_name = iface_var_name) interface_refs in
   match iface_ref with
@@ -313,272 +104,45 @@ let expand_interface_connections iface_var_name module_name interface_refs =
 let is_flattened_module module_name = 
   String.contains module_name 'p' || String.contains module_name 'c'
 
-let othtype = ref []
-  
-(* Parse type table entries *)
-let rec parse_type json =
-  let node_type = json |> member "type" |> to_string in
-  
-  match node_type with
-  | "BASICDTYPE" ->
-      let keyword = json |> member "keyword" |> to_string_option |> Option.value ~default:"logic" in
-      let range = json |> member "range" |> to_string_option in
-      BasicType { keyword; range }
-      
-  | "ENUMDTYPE" ->
-      let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-      let items_json = json |> member "itemsp" |> to_list in
-      let items = List.map (fun item ->
-        let item_name = item |> member "name" |> to_string in
-        let value = item |> member "valuep" |> to_list |> List.hd |> member "name" |> to_string in
-        (item_name, value)
-      ) items_json in
-      EnumType { name; items }
-      
-  | "REFDTYPE" ->
-      let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-      RefType { name; resolved = None }
-      
-  | "VOIDDTYPE" ->
-      let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-      VoidType { name; resolved = None }
-      
-  | "UNPACKARRAYDTYPE" ->
-      let base_ref = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
-      let range_json = json |> member "rangep" |> to_list in
-      let range = match range_json with
-        | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
-        | _ -> ""
-      in
-      let base_type = try Hashtbl.find type_table base_ref with Not_found -> UnknownType base_ref in
-      ArrayType { base = base_type; range }
+(* Resolve type reference to actual type info *)
+let resolve_type dtype_ref =
+  try 
+    match dtype_ref with
+    | RefType { name; _ } -> name
+    | BasicType { keyword; range = Some r; _ } -> keyword ^ " [" ^ r ^ "]"
+    | BasicType { keyword; range = None; _ } -> keyword
+    | EnumType { name; _ } -> name
+    | _ -> "logic"
+  with Not_found -> "logic"
 
-  | "IFACEREFDTYPE" ->
-      let ifacename = json |> member "ifaceName" |> to_string_option |> Option.value ~default:"" in
-      let modportname = json |> member "modportName" |> to_string_option |> Option.value ~default:"" in
-      let ifacep = json |> member "ifacep" |> to_string_option |> Option.value ~default:"" in
-      let modportp = json |> member "modportp" |> to_string_option |> Option.value ~default:"" in
-      IntfRefType { ifacename; modportname; ifacep; modportp }
+let resolve_type_with_brackets dtype_name = function Some dtype_ref ->
+  (* Use dtype_name if available, otherwise resolve from type table *)
+  let base_type = if dtype_name <> "" && dtype_name <> "logic" then dtype_name else resolve_type dtype_ref in
+  (* Fix double bracket issue: logic [[7:0]] -> logic [7:0] *)
+  let fixed_type = Str.global_replace (Str.regexp "\\[\\[\\([^]]+\\)\\]\\]") "[\\1]" base_type in
+  (* Convert "logic 7:0" format to "logic [7:0]" *)
+  if String.contains fixed_type ' ' && not (String.contains fixed_type '[') then
+    (match String.split_on_char ' ' fixed_type with
+    | [keyword; range] when String.contains range ':' -> 
+        Printf.sprintf "%s [%s]" keyword range
+    | _ -> fixed_type)
+  else fixed_type
+  | None -> "logic"
 
-  | oth -> othtype := oth :: !othtype; UnknownType node_type
-
-(* Parse type table and populate global table *)
-let rec parse_type_table json =
-  let types_json = json |> member "typesp" |> to_list in
-  List.iter (fun type_json ->
-    let addr = type_json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-    let parsed_type = parse_type type_json in
-    if addr <> "" then Hashtbl.add type_table addr parsed_type
-  ) types_json
-
-let othnode = ref []
-
-(* Parse JSON to AST with type table support *)
-let rec parse_json json =
-  let node_type = json |> member "type" |> to_string in
-  let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-  
-  match node_type with
-  | "NETLIST" ->
-      (* Parse type table first *)
-      let misc_list = json |> member "miscsp" |> to_list in
-      List.iter (fun misc ->
-        if (misc |> member "type" |> to_string) = "TYPETABLE" then
-          parse_type_table misc
-      ) misc_list;
-      
-      let modules = json |> member "modulesp" |> to_list |> List.map parse_json in
-      let type_list = Hashtbl.fold (fun k v acc -> (k, v) :: acc) type_table [] in
-      Netlist (modules, type_list)
-      
-  | "MODULE" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-      if addr <> "" then (print_endline (addr^":"^name); Hashtbl.add module_table addr name);
-      Module { name; stmts }
-      
-  | "PACKAGE" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      Package { name; stmts }
-
-  | "IFACE" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-      let interface_node = Interface { name; params = []; stmts } in
-      if addr <> "" then (print_endline (addr^":"^name); Hashtbl.add interface_table addr interface_node);
-      Hashtbl.add interface_table name interface_node; (* Also store by name *)
-      interface_node
-
-  | "CELL" ->
-      let pins = json |> member "pinsp" |> to_list |> List.map parse_json in
-      let modp_addr = json |> member "modp" |> to_string_option |> Option.value ~default:"" in
-      Cell { name; modp_addr; pins }
-      
-  | "PIN" ->
-      let expr = json |> member "exprp" |> to_list |> List.hd |> parse_json in
-      Pin { name; expr }
-      
-  | "MODPORT" ->
-      let vars = json |> member "varsp" |> to_list |> List.map parse_json in
-      Modport { name; vars }
-      
-  | "MODPORTVARREF" ->
-      let direction = json |> member "direction" |> to_string_option |> Option.value ~default:"" in
-      let var_ref = json |> member "varp" |> to_string_option |> Option.value ~default:"" in
-      ModportVarRef { name; direction; var_ref }
-            
-  | "VAR" ->
-      let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-      let dtype_name = json |> member "dtypeName" |> to_string_option |> Option.value ~default:"logic" in
-      let var_type = json |> member "varType" |> to_string_option |> Option.value ~default:"VAR" in
-      let direction = json |> member "direction" |> to_string_option |> Option.value ~default:"NONE" in
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      let is_param = json |> member "isParam" |> to_bool_option |> Option.value ~default:false in
-      let value = 
-        try 
-          let valuep = json |> member "valuep" |> to_list in
-          match valuep with
-          | v :: _ -> Some (parse_json v)
-          | [] -> None
-        with _ -> None
-      in
-      let v = Var { name; dtype_ref; var_type; direction; value; dtype_name; is_param } in
-      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add var_table nam v) [name;dtype_ref;addr] ;
-      v
-									    
-  | "CONST" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Const { name; dtype_ref }
-      
-  | "TYPEDEF" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Typedef { name; dtype_ref }
-      
-  | "FUNC" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      let vars = json |> member "fvarp" |> to_list |> List.map parse_json in
-      Func { name; dtype_ref; stmts; vars }
-      
-  | "ALWAYS" ->
-      let always = json |> member "keyword" |> to_string_option |> Option.value ~default:"always" in
-      let senses = json |> member "sensesp" |> to_list |> List.map parse_json in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      Always { always; senses; stmts }
-      
-  | "BEGIN" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      let is_generate = json |> member "generate" |> to_bool_option |> Option.value ~default:false in
-      Begin { name; stmts; is_generate }
-      
-  | "ASSIGN" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse_json in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse_json in
-      Assign { lhs; rhs; is_blocking = true }
-      
-  | "ASSIGNDLY" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse_json in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse_json in
-      Assign { lhs; rhs; is_blocking = false }
-      
-  | "ASSIGNW" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse_json in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse_json in
-      AssignW { lhs; rhs }
-      
-  | "IF" ->
-      let condition = json |> member "condp" |> to_list |> List.hd |> parse_json in
-      let then_stmt = json |> member "thensp" |> to_list |> List.hd |> parse_json in
-      let else_stmt = 
-        try Some (json |> member "elsesp" |> to_list |> List.hd |> parse_json)
-        with _ -> None
-      in
-      If { condition; then_stmt; else_stmt }
-      
-  | "CASE" ->
-      let expr = json |> member "exprp" |> to_list |> List.hd |> parse_json in
-      let items_json = json |> member "itemsp" |> to_list in
-      let items = List.map (fun item ->
-        let conditions = item |> member "condsp" |> to_list |> List.map parse_json in
-        let statements = item |> member "stmtsp" |> to_list |> List.map parse_json in
-        { conditions; statements }
-      ) items_json in
-      Case { expr; items }
-      
-  | "CASEITEM" ->
-      let conditions = json |> member "condsp" |> to_list |> List.map parse_json in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      CaseItem { conditions; stmts }
-      
-  | "WHILE" ->
-      let condition = json |> member "condp" |> to_list |> List.hd |> parse_json in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map parse_json in
-      let incs = json |> member "incsp" |> to_list |> List.map parse_json in
-      While { condition; stmts; incs }
-      
-  | "VARREF" ->
-      let access = json |> member "access" |> to_string_option |> Option.value ~default:"RD" in
-      VarRef { name; access }
-      
-  | "VARXREF" ->
-      let access = json |> member "access" |> to_string_option |> Option.value ~default:"RD" in
-      let dotted = json |> member "dotted" |> to_string_option |> Option.value ~default:"." in
-      VarXRef { name; access; dotted }
-      
-  | "SEL" ->
-      let expr = json |> member "fromp" |> to_list |> List.hd |> parse_json in
-      let lsb = try Some (json |> member "lsbp" |> to_list |> List.hd |> parse_json) with _ -> None in
-      let width = try Some (json |> member "widthp" |> to_list |> List.hd |> parse_json) with _ -> None in
-      let range = json |> member "declRange" |> to_string_option |> Option.value ~default:"" in
-      Sel { expr; lsb; width; range }
-      
-  | "ARRAYSEL" ->
-      let expr = json |> member "fromp" |> to_list |> List.hd |> parse_json in
-      let index = json |> member "bitp" |> to_list |> List.hd |> parse_json in
-      ArraySel { expr; index }
-      
-  | "FUNCREF" ->
-      let args = json |> member "pinsp" |> to_list |> 
-        List.filter_map (fun pin -> 
-          try Some (pin |> member "exprp" |> to_list |> List.hd |> parse_json)
-          with _ -> None
-        ) in
-      FuncRef { name; args }
-      
-  | "COND" ->
-      let condition = json |> member "condp" |> to_list |> List.hd |> parse_json in
-      let then_val = json |> member "thenp" |> to_list |> List.hd |> parse_json in
-      let else_val = json |> member "elsep" |> to_list |> List.hd |> parse_json in
-      Cond { condition; then_val; else_val }
-      
-  | "CONCAT" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse_json in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse_json in
-      Concat { parts = [lhs; rhs] }
-      
-  | "SENTREE" ->
-      let senses = json |> member "sensesp" |> to_list |> List.map parse_json in
-      SenTree senses
-      
-  | "SENITEM" ->
-      let edge = json |> member "edgeType" |> to_string_option |> Option.value ~default:"" in
-      let signal = json |> member "sensp" |> to_list |> List.hd |> parse_json in
-      let edge_str = String.lowercase_ascii edge ^ "edge" in
-      SenItem { edge_str; signal }
-      
-  (* Binary operators *)
-  | "AND" | "OR" | "XOR" | "EQ" | "NEQ" | "LT" | "GT" | "LTS" | "GTS" 
-  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "SHIFTL" | "SHIFTR" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse_json in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse_json in
-      BinaryOp { op = node_type; lhs; rhs }
-      
-  (* Unary operators *)
-  | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" ->
-      let operand = json |> member "lhsp" |> to_list |> List.hd |> parse_json in
-      UnaryOp { op = node_type; operand }
-      
-  | oth -> othnode := oth :: !othnode; Unknown (node_type, name)
+(* Extract interface signals with actual interface name *)
+let extract_interface_signals interface_name interface_stmts =
+  List.fold_left (fun acc stmt ->
+    match stmt with
+    | Var { name; dtype_ref; dtype_name; var_type = "VAR"; _ } ->
+        let signal_type = resolve_type_with_brackets dtype_name dtype_ref in
+        let flattened_name = Printf.sprintf "%s_%s" interface_name name in
+        (flattened_name, signal_type, name) :: acc
+    | Var { name; dtype_ref; dtype_name; var_type = "PORT"; direction = "INPUT"; _ } ->
+        let signal_type = resolve_type_with_brackets dtype_name dtype_ref in
+        let flattened_name = Printf.sprintf "%s_%s" interface_name name in
+        (flattened_name, signal_type, name) :: acc
+    | _ -> acc
+  ) [] interface_stmts
 
 (* Interface flattening logic *)
 
@@ -590,7 +154,7 @@ let flatten_interface_to_ports interface_name interface_def =
       | Var { name; dtype_ref; dtype_name; _ } when name <> "clk" ->
           (* Convert interface signals to module ports *)
           let flattened_name = Printf.sprintf "%s_%s" interface_name name in
-          (flattened_name, resolve_type_with_brackets dtype_ref dtype_name) :: acc
+          (flattened_name, resolve_type_with_brackets dtype_name dtype_ref) :: acc
       | _ -> acc
     ) [] stmts
   in
@@ -603,7 +167,7 @@ let dbgdecls = ref []
 let rec generate_sv node indent =
   let ind = String.make (indent * 2) ' ' in
   match node with
-  | Netlist (modules, _) ->
+  | Netlist (modules) ->
       let nod = ref [] in
       let cat = String.concat "\n\n" (List.map (fun itm -> nod := itm :: !nod; generate_sv_indent 0 itm) modules) in
       nodelst := List.rev !nod;
@@ -646,15 +210,13 @@ let rec generate_sv node indent =
   | Interface { name; stmts; _ } ->
       (* Interfaces are flattened away, but we need to track their definitions *)
       Printf.sprintf "// Interface %s flattened" name
-
       
-  | Cell { name; modp_addr; pins; _ } ->
-      let module_name = try Hashtbl.find module_table modp_addr with Not_found -> "unknown_module" in
-      
+  | Cell { name; modp_addr; pins; _ } ->      
       (* Check if this is an interface instantiation by checking modp_addr against interface table *)
-      if Hashtbl.mem interface_table modp_addr then
+      (match modp_addr with
+        | Some (Interface { name }) ->
         Printf.sprintf "%s// Interface %s instantiation flattened away" ind name
-      else
+        | Some (Module { name }) -> let module_name = name in
         (* Generate connections for module instantiations *)
         let pin_connections = List.fold_left (fun acc pin ->
           match pin with
@@ -663,24 +225,22 @@ let rec generate_sv node indent =
               ".clk(clk)" :: acc
           | Pin { expr = VarRef { name = iface_name; _ }; _ } ->
 	      (* Interface connection - expand to flattened signals *)
-              print_endline ("Expand: "^iface_name);
-	      let interface_refs = extract_interface_refs () in
-              let expanded = expand_interface_connections iface_name module_name interface_refs in
+              print_endline ("Expand: "^iface_name^" "^module_name);
+              let expanded = expand_interface_connections iface_name module_name in
               expanded @ acc
           | Pin { expr = VarXRef { name = signal; dotted; _ }; _ } ->
               let flattened_name = Printf.sprintf "%s_%s" dotted signal in
               (Printf.sprintf ".%s(%s)" signal flattened_name) :: acc
           | _ -> acc
         ) [] pins in
-        
-        let connections = String.concat ", " (List.rev pin_connections) in
-        Printf.sprintf "%s%s %s(%s);" ind module_name name connections
-      
+	    let connections = String.concat ", " (List.rev pin_connections) in
+	    Printf.sprintf "%s%s %s(%s);" ind module_name name connections
+         | _ -> "unknown");
   | Pin { name; expr; _ } ->
       generate_sv expr 0
         
   | Var { name; dtype_ref; var_type; direction; value; dtype_name; is_param; _ } ->
-      let resolved_type = resolve_type_with_brackets dtype_ref dtype_name in
+      let resolved_type = resolve_type_with_brackets dtype_name dtype_ref in
       let prefix = match var_type with
         | "LPARAM" -> "localparam"
         | "GPARAM" -> "parameter"
@@ -702,11 +262,11 @@ let rec generate_sv node indent =
   | Const { name } -> name
       
   | Typedef { name; dtype_ref; _ } ->
-      let resolved_type = resolve_type dtype_ref in
+      let resolved_type = match dtype_ref with Some r -> resolve_type r | None -> "logic" in
       Printf.sprintf "%stypedef %s %s;" ind resolved_type name
       
   | Func { name; dtype_ref; stmts; vars; _ } ->
-      let return_type = resolve_type_with_brackets dtype_ref "" in
+      let return_type = resolve_type_with_brackets "" dtype_ref in
       (* Extract input parameters from vars, filtering out the return variable *)
       let param_vars = List.filter (function 
         | Var { var_type = "PORT"; direction = "INPUT"; name = param_name; _ } when param_name <> name -> true 
@@ -714,7 +274,7 @@ let rec generate_sv node indent =
       let params = String.concat ", " (List.map (fun v ->
         match v with
         | Var { name = param_name; dtype_ref; dtype_name; _ } ->
-            let ptype = resolve_type_with_brackets dtype_ref dtype_name in
+            let ptype = resolve_type_with_brackets dtype_name dtype_ref in
             Printf.sprintf "input %s %s" ptype param_name
         | _ -> ""
       ) param_vars) in
@@ -969,7 +529,9 @@ and generate_top_module name stmts =
   let fixed_cells = List.filter_map (fun cell ->
     match cell with
     | Cell { modp_addr; _ } as c ->
-        let module_name = try Hashtbl.find module_table modp_addr with Not_found -> "" in
+        let module_name = match modp_addr with
+          | Some (Module { name }) -> name
+	  | _ -> "" in
         if Hashtbl.mem interface_table module_name then None
         else Some (generate_sv c 1)
     | _ -> Some (generate_sv cell 1)
@@ -1006,7 +568,7 @@ and generate_interface_module name stmts =
             ) iface_stmts in
             match var_info with
             | Some (Var { dtype_ref; dtype_name; _ }) ->
-                let var_type = resolve_type_with_brackets dtype_ref dtype_name in
+                let var_type = resolve_type_with_brackets dtype_name dtype_ref in
                 Some (Printf.sprintf "  %s %s %s" port_dir var_type var_name)
             | _ -> None
           ) directions in
@@ -1103,37 +665,3 @@ and generate_internals stmts indent =
     | _ -> true
   ) stmts in
   String.concat "\n" (List.map (generate_sv_indent indent) internals)
-
-(* Main translation function *)
-let translate_tree_to_sv json_file =
-  Hashtbl.clear type_table;  (* Clear any previous state *)
-  Hashtbl.clear interface_table;
-  Hashtbl.clear module_table;
-  Hashtbl.clear var_table;
-  print_endline ("JSON: "^json_file);
-  let json = Yojson.Basic.from_file json_file in
-  let ast = parse_json json in
-  let sv_code = generate_sv ast 0 in
-  sv_code
-
-(* Usage example *)
-let () =
-    (try
-      let obj = "obj_dir/" in
-      let rslt = "results/" in
-      (try Unix.mkdir rslt 0o750 with e -> Printf.eprintf "%s: %s\n" rslt (Printexc.to_string e));
-      let lst = ref [] in
-      let fd = Unix.opendir obj in
-      (try while true do
-	   let f = Unix.readdir(fd) in if f.[0]<>'.' then lst := f :: !lst;
-	   done with End_of_file -> Unix.closedir fd);
-      List.iter (fun itm ->
-      let result = translate_tree_to_sv (obj^itm) in
-      let fd = open_out (rslt^"decompile_"^itm^".sv") in
-      output_string fd result;
-      close_out fd) !lst;
-    with
-    | Sys_error msg -> Printf.eprintf "Error: %s\n" msg
-    | Yojson.Json_error msg -> Printf.eprintf "JSON Error: %s\n" msg
-    | e -> Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string e));
-    flush stderr

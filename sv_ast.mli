@@ -12,8 +12,10 @@ type sv_type =
   | StructType of { name: string; packed: bool; members: sv_type list }
   | RefType of { name: string; resolved: sv_type option }
   | VoidType of { name: string; resolved: sv_type option }
+  | ArrayType' of { base: string; range: string }
   | ArrayType of { base: sv_type; range: string }
-  | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option; oldport:string }
+  | IntfRefType' of { ifacename: string; modportname: string; ifacep: string; modportp: string }
+  | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option }
   | UnknownType of string
 
 (* AST node types *)
@@ -31,6 +33,11 @@ and sv_node =
       name: string;
       params: sv_node list;
       stmts: sv_node list;
+    }
+  | Cell' of {
+      name: string;
+      modp_addr: string;
+      pins: sv_node list;
     }
   | Cell of {
       name: string;
@@ -50,6 +57,15 @@ and sv_node =
       direction: string;
       var_ref: string list
     }
+  | Var' of {
+      name: string;
+      dtype_ref: string;
+      var_type: string;
+      direction: string;
+      value: sv_node option;
+      dtype_name: string;
+      is_param: bool;
+    }
   | Var of {
       name: string;
       dtype_ref: sv_type option;
@@ -59,13 +75,27 @@ and sv_node =
       dtype_name: string;
       is_param: bool;
     }
+  | Const' of {
+      name: string;
+      dtype_ref: string;
+    }
   | Const of {
       name: string;
       dtype_ref: sv_type option;
     }
+  | Typedef' of {
+      name: string;
+      dtype_ref: string;
+    }
   | Typedef of {
       name: string;
       dtype_ref: sv_type option;
+    }
+  | Func' of {
+      name: string;
+      dtype_ref: string;
+      stmts: sv_node list;
+      vars: sv_node list;
     }
   | Func of {
       name: string;

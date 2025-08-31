@@ -36,19 +36,17 @@ let rec parse_type attr json =
         | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
         | _ -> ""
       in
-      let base_type = try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType base_ref in
-      ArrayType { base = base_type; range }
+      ArrayType' { base = base_ref; range }
 
   | "IFACEREFDTYPE" ->
       let ifacename = json |> member "ifaceName" |> to_string_option |> Option.value ~default:"" in
       let modportname = json |> member "modportName" |> to_string_option |> Option.value ~default:"" in
       let ifacep = json |> member "ifacep" |> to_string_option |> Option.value ~default:"" in
       let modportp = json |> member "modportp" |> to_string_option |> Option.value ~default:"" in
-      IntfRefType { ifacename;
+      IntfRefType' { ifacename;
       modportname;
-      ifacep=Hashtbl.find_opt attr.interface_table ifacep;
-      modportp=Hashtbl.find_opt attr.interface_table modportp;
-      oldport=modportp}
+      ifacep;
+      modportp }
 
   | oth -> UnknownType node_type
 
@@ -110,7 +108,7 @@ let rec parse_json attr json =
   | "CELL" ->
       let pins = json |> member "pinsp" |> to_list |> List.map (parse' attr name) in
       let modp_addr = json |> member "modp" |> to_string_option |> Option.value ~default:"" in
-      Cell { name; modp_addr=Hashtbl.find_opt attr.module_table modp_addr; pins }
+      Cell' { name; modp_addr; pins }
       
   | "PIN" ->
       let expr = json |> member "exprp" |> to_list |> List.hd |> parse' attr name in
@@ -145,27 +143,23 @@ let rec parse_json attr json =
           | [] -> None
         with _ -> None
       in
-      let typ = match Hashtbl.find_opt attr.type_table dtype_ref with
-        | Some (IntfRefType {ifacename; modportname; modportp; oldport}) -> Some (IntfRefType {ifacename; modportname; ifacep=Hashtbl.find_opt attr.interface_table ifacename; modportp=(match modportp with None -> Hashtbl.find_opt attr.interface_table oldport | Some p -> Some p); oldport})
-        | Some x -> Some x
-        | None -> None in
-      let v = Var { name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param } in
+      let v = Var' { name; dtype_ref; var_type; direction; value; dtype_name; is_param } in
       if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr] ;
       v
 									    
   | "CONST" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Const { name; dtype_ref=Hashtbl.find_opt attr.type_table dtype_ref }
+      Const' { name; dtype_ref }
       
   | "TYPEDEF" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Typedef { name; dtype_ref = Hashtbl.find_opt attr.type_table dtype_ref }
+      Typedef' { name; dtype_ref }
       
   | "FUNC" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
-      Func { name; dtype_ref = Hashtbl.find_opt attr.type_table dtype_ref; stmts; vars }
+      Func' { name; dtype_ref; stmts; vars }
       
   | "ALWAYS" ->
       let always = json |> member "keyword" |> to_string_option |> Option.value ~default:"always" in
@@ -289,6 +283,73 @@ let rec parse_json attr json =
 
   and parse' attr name = parse_json ({attr with parent=name::attr.parent})
 
+let othrw = ref None
+let othrwtyp = ref None
+
+let rec rw attr = function
+| Netlist lst -> Netlist (List.map (rw attr) lst)
+| Module {name; stmts} -> Module {name; stmts=List.map (rw attr) stmts}
+| Var' {name; dtype_ref; var_type; direction; value; dtype_name; is_param} ->
+  let typ = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) in
+  Var {name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param}
+| Cell' {name; modp_addr; pins } ->
+  Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=List.map (rw attr) pins}
+| Pin {name; expr} -> Pin {name; expr=rw attr expr}
+| Assign {lhs; rhs; is_blocking} -> Assign {lhs=rw attr lhs; rhs=rw attr rhs; is_blocking}
+| AssignW {lhs; rhs} -> AssignW {lhs=rw attr lhs; rhs=rw attr rhs}
+| VarRef {name; access} as v -> v
+| VarXRef {name; access; dotted} as v -> v
+| Always {always; senses; stmts} -> Always {always; senses=List.map (rw attr) senses; stmts=List.map (rw attr) stmts};
+| SenTree lst -> SenTree (List.map (rw attr) lst)
+| SenItem {edge_str; signal} -> SenItem {edge_str; signal=rw attr signal}
+| BinaryOp {op; lhs; rhs} -> BinaryOp {op; lhs=rw attr lhs; rhs=rw attr rhs}
+| Interface {name; params; stmts} ->
+  Interface {name; params=List.map (rw attr) params; stmts=List.map (rw attr) stmts}
+| Modport { name; vars } -> Modport { name; vars=List.map (rw attr) vars }
+| ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
+| Const' { name; dtype_ref } ->
+  Const { name; dtype_ref=Hashtbl.find_opt attr.type_table dtype_ref }
+| Const _
+| Cell _
+| Var _ as skip -> skip
+| Package _
+| Typedef' _
+| Typedef _
+| Func' _
+| Func _
+| Begin _
+| If _
+| Case _
+| While _
+| Sel _
+| ArraySel _
+| FuncRef _
+| UnaryOp _
+| Concat _
+| Cond _
+| CaseItem _
+| Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"
+
+and rwopt attr = function
+| Some x -> Some (rw attr x)
+| None -> None
+
+and rwtyp' attr = function
+| Some x -> Some (rwtyp attr x)
+| None -> None
+
+and rwtyp attr = function
+| ArrayType' { base=base_ref; range } ->
+  let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType base_ref) in
+  ArrayType { base = base_type; range }
+| IntfRefType' { ifacename; modportname; ifacep; modportp } ->
+  IntfRefType { ifacename;
+  modportname;
+  ifacep=Hashtbl.find_opt attr.interface_table ifacep;
+  modportp=Hashtbl.find_opt attr.interface_table modportp }
+| BasicType _ as t -> t
+| oth -> othrwtyp := Some oth; failwith "othrwtyp"
+
 let dbgpass1 = ref (Unknown ("",""))
 let dbgpass2 = ref (Unknown ("",""))
 let mods = ref []
@@ -305,8 +366,9 @@ let parse json =
   module_table = Hashtbl.create 20;
   var_table = Hashtbl.create 20;
   } in
-  dbgpass1 := parse_json attr json;
-  let ast = parse_json attr json in
+  let ast' = parse_json attr json in
+  dbgpass1 := ast';
+  let ast = rw attr (rw attr ast') in
   dbgpass2 := ast;
   mods := [];
   Hashtbl.iter (fun k x -> mods := (k,x) :: !mods) attr.module_table;

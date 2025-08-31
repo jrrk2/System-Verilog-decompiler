@@ -309,6 +309,8 @@ let rec rw attr = function
 | ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
 | Const' { name; dtype_ref } ->
   Const { name; dtype_ref=Hashtbl.find_opt attr.type_table dtype_ref }
+| Begin { name; stmts; is_generate } -> Begin { name; stmts=List.map (rw attr) stmts; is_generate }
+| Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
 | Const _
 | Cell _
 | Var _ as skip -> skip
@@ -317,11 +319,9 @@ let rec rw attr = function
 | Typedef _
 | Func' _
 | Func _
-| Begin _
 | If _
 | Case _
 | While _
-| Sel _
 | ArraySel _
 | FuncRef _
 | UnaryOp _

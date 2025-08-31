@@ -47,7 +47,8 @@ let rec parse_type attr json =
       IntfRefType { ifacename;
       modportname;
       ifacep=Hashtbl.find_opt attr.interface_table ifacep;
-      modportp=Hashtbl.find_opt attr.interface_table modportp }
+      modportp=Hashtbl.find_opt attr.interface_table modportp;
+      oldport=modportp}
 
   | oth -> UnknownType node_type
 
@@ -144,7 +145,10 @@ let rec parse_json attr json =
           | [] -> None
         with _ -> None
       in
-      let typ = Hashtbl.find_opt attr.type_table dtype_ref in
+      let typ = match Hashtbl.find_opt attr.type_table dtype_ref with
+        | Some (IntfRefType {ifacename; modportname; modportp; oldport}) -> Some (IntfRefType {ifacename; modportname; ifacep=Hashtbl.find_opt attr.interface_table ifacename; modportp=(match modportp with None -> Hashtbl.find_opt attr.interface_table oldport | Some p -> Some p); oldport})
+        | Some x -> Some x
+        | None -> None in
       let v = Var { name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param } in
       if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr] ;
       v

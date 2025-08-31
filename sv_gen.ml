@@ -1,6 +1,6 @@
 open Sv_ast
 
-let debug = ref false
+let debug = ref true
 
 let resolve_type = function
   | Some (RefType { name; _ }) -> name
@@ -59,7 +59,6 @@ let generate_interface_ports iface_name modport_def interface_def =
   if !debug then Printf.printf "DEBUG: Generating ports for interface '%s'\n" iface_name;
   let directions = get_modport_directions modport_def in
   if !debug then Printf.printf "DEBUG: Modport directions: %d\n" (List.length directions);
-  List.iter (fun (name, dir) -> if !debug then Printf.printf "DEBUG: Port %s -> %s\n" name dir) directions;
   
   let interface_vars = match interface_def with
     | Some (Interface { stmts; _ }) -> 
@@ -100,32 +99,73 @@ let generate_interface_signals iface_var_name interface_def =
       if !debug then Printf.printf "DEBUG: Interface has %d statements\n" (List.length stmts);
       let signals = List.fold_left (fun acc stmt ->
         match stmt with
-        | Var { name; dtype_ref; dtype_name; var_type = "VAR"; _ }
-        | Var { name; dtype_ref; dtype_name; var_type = "PORT"; direction = "INPUT"; _ } ->
+        | Var { name; dtype_ref; dtype_name; var_type = "VAR"; _ } ->
             let signal_type = resolve_type_with_brackets dtype_name dtype_ref in
             let flattened_name = Printf.sprintf "%s_%s" iface_var_name name in
             if !debug then Printf.printf "DEBUG: Generated signal: %s %s\n" signal_type flattened_name;
             (Printf.sprintf "  %s %s;" signal_type flattened_name) :: acc
-        | Var { name; var_type; _ } ->
-            if !debug then Printf.printf "DEBUG: Skipping var '%s' type '%s'\n" name var_type;
-            acc
         | _ -> acc
       ) [] stmts |> List.rev in
       if !debug then Printf.printf "DEBUG: Total signals generated: %d\n" (List.length signals);
       signals
-  | Some _ -> if !debug then Printf.printf "DEBUG: Unexpected definition found\n";
-      []
-  | None -> 
-      if !debug then Printf.printf "DEBUG: No interface definition found\n";
-      []
+  | _ -> []
+
+(* Convert VarXRef to appropriate signal name *)
+let convert_varxref_to_signal var_name dotted_name top_level_ports =
+  (* For assignments, we need to be more careful about when to use direct port names *)
+  match var_name with
+  | name when List.mem name top_level_ports -> 
+      (* This is a top-level port - use direct name for LHS of assignments *)
+      name
+  | _ -> 
+      (* Use flattened interface signal name *)
+      Printf.sprintf "%s_%s" dotted_name var_name
 
 (* Generate port connections for module instantiation *)
-let generate_port_connections iface_var_name modport_def =
+let generate_port_connections iface_var_name modport_def interface_def top_level_ports =
+  if !debug then Printf.printf "DEBUG: generate_port_connections called with iface_var_name=%s\n" iface_var_name;
   let directions = get_modport_directions modport_def in
-  List.map (fun (var_name, _) ->
-    let flattened_name = Printf.sprintf "%s_%s" iface_var_name var_name in
-    Printf.sprintf ".%s(%s)" var_name flattened_name
-  ) directions
+  if !debug then Printf.printf "DEBUG: Found %d directions from modport\n" (List.length directions);
+  List.iter (fun (name, dir) -> if !debug then Printf.printf "DEBUG: Direction %s -> %s\n" name dir) directions;
+  
+  (* Always include clock connection *)
+  let clock_conn = ".clk(clk)" in
+  
+  let other_conns = List.fold_left (fun acc (var_name, _) ->
+    if var_name = "clk" then acc  (* Skip clk, already handled *)
+    else
+      let signal_name = Printf.sprintf "%s_%s" iface_var_name var_name in
+      let conn = Printf.sprintf ".%s(%s)" var_name signal_name in
+      if !debug then Printf.printf "DEBUG: Generated connection: %s\n" conn;
+      conn :: acc
+  ) [] directions in
+  
+  let result = clock_conn :: (List.rev other_conns) in
+  if !debug then Printf.printf "DEBUG: Final connections: [%s]\n" (String.concat "; " result);
+  result
+
+(* Fix VarXRef nodes to use appropriate signal names *)
+let fix_varxref_in_node top_level_ports iface_var_name node =
+  let rec fix_node = function
+    | VarXRef { name; dotted; _ } ->
+        let signal_name = convert_varxref_to_signal name dotted top_level_ports in
+        VarRef { name = signal_name; access = "RD" }
+    | Assign { lhs; rhs; is_blocking } ->
+        Assign { lhs = fix_node lhs; rhs = fix_node rhs; is_blocking }
+    | BinaryOp { op; lhs; rhs } ->
+        BinaryOp { op; lhs = fix_node lhs; rhs = fix_node rhs }
+    | UnaryOp { op; operand } ->
+        UnaryOp { op; operand = fix_node operand }
+    | Always { always; senses; stmts } ->
+        let fixed_senses = List.map fix_node senses in
+        let fixed_stmts = List.map fix_node stmts in
+        Always { always; senses = fixed_senses; stmts = fixed_stmts }
+    | SenTree senses ->
+        SenTree (List.map fix_node senses)
+    | SenItem { edge_str; signal } ->
+        SenItem { edge_str; signal = fix_node signal }
+    | node -> node
+  in fix_node node
 
 let rec generate_sv node indent =
   let ind = String.make (indent * 2) ' ' in
@@ -140,18 +180,18 @@ let rec generate_sv node indent =
 
   | Module { name; stmts; _ } ->
       Printf.printf "ERROR: generate_sv called on Module without interface context\n";
-      generate_regular_module name stmts
+      generate_regular_module name stmts []
 
   | Interface { name; _ } ->
-      Printf.sprintf "// Interface %s flattened" name
+      ""  (* Skip interfaces in output *)
 
   | Cell { name; modp_addr; pins; _ } ->
       (match modp_addr with
       | Some (Interface { name = iface_name; _ }) ->
-          Printf.sprintf "%s// Interface %s instantiation flattened away" ind iface_name
+          ""  (* Skip interface instantiations *)
       | Some (Module { name = module_name; _ } as mod_def) ->
-          let connections = generate_cell_connections_for_module pins (Some mod_def) in
-          Printf.sprintf "%s%s %s(%s);" ind module_name name (String.concat ", " connections)
+          let connections = generate_cell_connections pins (Some mod_def) [] in
+          Printf.sprintf "%s%s %s (%s);" ind module_name name (String.concat ", " connections)
       | _ -> Printf.sprintf "%s// Unknown cell %s" ind name)
 
   | Var { name; dtype_ref; var_type; direction; value; dtype_name; is_param; _ } ->
@@ -221,9 +261,6 @@ and generate_sv_indent indent node = generate_sv node indent
 
 (* New function that carries interface context *)
 and generate_sv_with_interfaces node indent interfaces =
-(*
-  let ind = String.make (indent * 2) ' ' in
-*)
   match node with
   | Module { name; stmts; _ } ->
       let interface_refs = extract_interface_refs stmts in
@@ -234,7 +271,7 @@ and generate_sv_with_interfaces node indent interfaces =
       else if interface_refs <> [] then
         generate_interface_module_with_interfaces name stmts interface_refs interfaces
       else
-        generate_regular_module name stmts
+        generate_regular_module name stmts []
   
   | _ -> generate_sv node indent
 
@@ -242,8 +279,16 @@ and generate_sv_with_interfaces_indent indent interfaces node =
   generate_sv_with_interfaces node indent interfaces
 
 (* Generate top module with interface flattening *)
-and generate_top_module name stmts interface_refs =
+and generate_top_module_with_interfaces name stmts interface_refs interfaces =
   if !debug then Printf.printf "DEBUG: Generating top module '%s' with %d interface refs\n" name (List.length interface_refs);
+  
+  (* Extract top level port names *)
+  let top_level_ports = List.fold_left (fun acc stmt ->
+    match stmt with
+    | Var { var_type = "PORT"; name; _ } -> name :: acc
+    | _ -> acc
+  ) [] stmts in
+  
   let (regular_ports, cells, other_stmts) = 
     List.fold_left (fun (ports, cells, others) stmt ->
       match stmt with
@@ -253,62 +298,90 @@ and generate_top_module name stmts interface_refs =
       | _ -> (ports, cells, stmt :: others)
     ) ([], [], []) stmts in
 
-  if !debug then Printf.printf "DEBUG: Found %d regular ports, %d cells, %d other stmts\n" 
-    (List.length regular_ports) (List.length cells) (List.length other_stmts);
-
   (* Generate regular port declarations *)
-  let port_decls = List.map (fun v -> generate_sv v 1) regular_ports in
+  let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) regular_ports in
   
   (* Generate interface signal declarations *)
-  let signal_decls = List.fold_left (fun acc (var_name, iface_name, _, modportp) ->
-    if !debug then Printf.printf "DEBUG: Processing interface ref %s -> %s\n" var_name iface_name;
-    let interface_def = find_interface_in_stmts iface_name stmts in
+  let signal_decls = List.fold_left (fun acc (var_name, iface_name, _, _) ->
+    let interface_def = find_interface_by_name iface_name interfaces in
     let signals = generate_interface_signals var_name interface_def in
     signals @ acc
   ) [] interface_refs in
 
-  if !debug then Printf.printf "DEBUG: Generated %d signal declarations\n" (List.length signal_decls);
+  (* Generate cell instantiations with proper connections *)
+  let cell_stmts = List.map (fun cell ->
+    match cell with
+    | Cell { name; modp_addr; pins; _ } ->
+        (match modp_addr with
+        | Some (Module { name = module_name; stmts = mod_stmts; _ }) ->
+            let mod_interface_refs = extract_interface_refs mod_stmts in
+            (match mod_interface_refs with
+            | (_, iface_name, _, modportp) :: _ ->
+                let interface_def = find_interface_by_name iface_name interfaces in
+                (* Extract the actual interface variable name from our interface_refs *)
+                let iface_var_name = match interface_refs with
+                  | (var_name, _, _, _) :: _ -> var_name
+                  | [] -> "sif"  (* fallback *)
+                in
+                let connections = generate_port_connections iface_var_name modportp interface_def top_level_ports in
+                Printf.sprintf "  %s %s (%s);" module_name name (String.concat ", " connections)
+            | [] ->
+                Printf.sprintf "  %s %s ();" module_name name)
+        | Some (Interface _) -> ""  (* Skip interface instantiations *)
+        | _ -> "  // Unknown cell")
+    | _ -> ""
+  ) cells in
 
-  (* Generate clock assignments *)
-  let clock_assigns = List.map (fun (var_name, _, _, _) ->
-    Printf.sprintf "  assign %s_clk = clk;" var_name
-  ) interface_refs in
-
-  (* Generate cell instantiations *)
-  let cell_stmts = List.map (generate_sv_indent 1) cells in
-
-  (* Generate other assignments *)
-  let other_assigns = List.map (generate_sv_indent 1) other_stmts in
+  (* Generate other assignments, fixing VarXRef nodes *)
+  let other_assigns = List.map (fun stmt ->
+    match stmt with
+    | AssignW { lhs; rhs } ->
+        (* For assign statements, we need special handling *)
+        let fixed_rhs = match rhs with
+          | VarXRef { name; dotted; _ } -> 
+              let signal_name = Printf.sprintf "%s_%s" dotted name in
+              VarRef { name = signal_name; access = "RD" }
+          | _ -> rhs
+        in
+        let fixed_lhs = match lhs with
+          | VarRef { name; _ } when List.mem name top_level_ports -> lhs  (* Keep top-level port as-is *)
+          | _ -> fix_varxref_in_node top_level_ports "" lhs
+        in
+        generate_sv_with_interfaces (AssignW { lhs = fixed_lhs; rhs = fixed_rhs }) 1 interfaces
+    | _ -> generate_sv_with_interfaces stmt 1 interfaces
+  ) other_stmts in
 
   let port_str = String.concat ",\n" port_decls in
-  let body_parts = signal_decls @ clock_assigns @ cell_stmts @ other_assigns in
-  let body = String.concat "\n" body_parts in
+  let body_parts = signal_decls @ cell_stmts @ other_assigns in
+  let body = String.concat "\n" (List.filter (fun s -> s <> "") body_parts) in
 
   Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str body
 
 (* Generate interface module with flattened ports *)
-and generate_interface_module name stmts interface_refs =
+and generate_interface_module_with_interfaces name stmts interface_refs interfaces =
   match interface_refs with
   | (var_name, iface_name, modport_name, modportp) :: _ ->
-      let interface_def = find_interface_in_stmts iface_name stmts in
+      let interface_def = find_interface_by_name iface_name interfaces in
       let flattened_ports = generate_interface_ports var_name modportp interface_def in
       let port_str = String.concat ",\n" flattened_ports in
       
-      (* Filter out interface references from internals *)
+      (* Extract top level port names for this module *)
+      let module_port_names = get_modport_directions modportp |> List.map fst in
+      
+      (* Filter out interface references from internals and fix VarXRef *)
       let internals = List.filter (function
         | Var { var_type = "IFACEREF"; _ } -> false
         | _ -> true
       ) stmts in
       
-      (* Fix VarXRef nodes to use direct variable names *)
-      let fixed_internals = List.map fix_varxref_stmt internals in
-      let internal_str = String.concat "\n" (List.map (generate_sv_indent 1) fixed_internals) in
+      let fixed_internals = List.map (fix_varxref_in_node module_port_names var_name) internals in
+      let internal_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent 1 interfaces) fixed_internals) in
       
       Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str internal_str
-  | [] -> generate_regular_module name stmts
+  | [] -> generate_regular_module name stmts []
 
 (* Generate regular module *)
-and generate_regular_module name stmts =
+and generate_regular_module name stmts top_level_ports =
   let ports = List.filter_map (function
     | Var { var_type = "PORT"; _ } as v -> Some (generate_sv v 1 |> String.trim)
     | _ -> None
@@ -324,136 +397,23 @@ and generate_regular_module name stmts =
   
   Printf.sprintf "module %s%s;\n%s\nendmodule" name port_str internal_str
 
-(* Fix VarXRef statements to use direct variable names *)
-and fix_varxref_stmt = function
-  | Always { always; senses; stmts } ->
-      let fixed_stmts = List.map (fun stmt ->
-        let rec fix_node = function
-          | VarXRef { name; _ } -> VarRef { name; access = "RD" }
-          | Assign { lhs; rhs; is_blocking } ->
-              Assign { lhs = fix_node lhs; rhs = fix_node rhs; is_blocking }
-          | BinaryOp { op; lhs; rhs } ->
-              BinaryOp { op; lhs = fix_node lhs; rhs = fix_node rhs }
-          | node -> node
-        in fix_node stmt
-      ) stmts in
-      Always { always; senses; stmts = fixed_stmts }
-  | stmt -> stmt
-
-(* Find interface definition in statements *)
-and find_interface_in_stmts iface_name stmts =
+(* Find interface definition by name in the interface list *)
+and find_interface_by_name iface_name interfaces =
   List.find_opt (function
     | Interface { name; _ } when name = iface_name -> true
     | _ -> false
-  ) stmts
+  ) interfaces
 
-(* Generate top module with interface flattening - with interface context *)
-and generate_top_module_with_interfaces name stmts interface_refs interfaces =
-  if !debug then Printf.printf "DEBUG: Generating top module '%s' with %d interface refs\n" name (List.length interface_refs);
-  let (regular_ports, cells, other_stmts) = 
-    List.fold_left (fun (ports, cells, others) stmt ->
-      match stmt with
-      | Var { var_type = "PORT"; _ } as v -> (v :: ports, cells, others)
-      | Var { var_type = "IFACEREF"; _ } -> (ports, cells, others)
-      | Cell _ as c -> (ports, c :: cells, others)
-      | _ -> (ports, cells, stmt :: others)
-    ) ([], [], []) stmts in
+(* Extract interface variable name from pins *)
+and extract_iface_var_name_from_pins pins =
+  match pins with
+  | Pin { expr = VarRef { name; _ }; _ } :: _ when name <> "clk" -> name
+  | _ -> "sif"  (* default fallback *)
 
-  if !debug then Printf.printf "DEBUG: Found %d regular ports, %d cells, %d other stmts\n" 
-    (List.length regular_ports) (List.length cells) (List.length other_stmts);
-
-  (* Generate regular port declarations *)
-  let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) regular_ports in
+(* Generate cell connections based on pin information *)
+and generate_cell_connections pins module_def top_level_ports =
+  match pins with
+  | [Pin { expr = VarRef { name = "clk"; _ }; _ }] -> [".clk(clk)"]
+  | [Pin { expr = VarRef { name; _ }; _ }] -> [Printf.sprintf ".sif(%s)" name]  
+  | _ -> []
   
-  (* Generate interface signal declarations *)
-  let signal_decls = List.fold_left (fun acc (var_name, iface_name, _, modportp) ->
-    if !debug then Printf.printf "DEBUG: Processing interface ref %s -> %s\n" var_name iface_name;
-    let interface_def = find_interface_by_name iface_name interfaces in
-    let signals = generate_interface_signals var_name interface_def in
-    signals @ acc
-  ) [] interface_refs in
-
-  if !debug then Printf.printf "DEBUG: Generated %d signal declarations\n" (List.length signal_decls);
-
-  (* Generate clock assignments *)
-  let clock_assigns = List.map (fun (var_name, _, _, _) ->
-    Printf.sprintf "  assign %s_clk = clk;" var_name
-  ) interface_refs in
-
-  (* Generate cell instantiations *)
-  let cell_stmts = List.map (generate_sv_with_interfaces_indent 1 interfaces) cells in
-
-  (* Generate other assignments *)
-  let other_assigns = List.map (generate_sv_with_interfaces_indent 1 interfaces) other_stmts in
-
-  let port_str = String.concat ",\n" port_decls in
-  let body_parts = signal_decls @ clock_assigns @ cell_stmts @ other_assigns in
-  let body = String.concat "\n" body_parts in
-
-  Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str body
-
-(* Generate interface module with flattened ports - with interface context *)
-and generate_interface_module_with_interfaces name stmts interface_refs interfaces =
-  match interface_refs with
-  | (var_name, iface_name, modport_name, modportp) :: _ ->
-      let interface_def = find_interface_by_name iface_name interfaces in
-      let flattened_ports = generate_interface_ports var_name modportp interface_def in
-      let port_str = String.concat ",\n" flattened_ports in
-      
-      (* Filter out interface references from internals *)
-      let internals = List.filter (function
-        | Var { var_type = "IFACEREF"; _ } -> false
-        | _ -> true
-      ) stmts in
-      
-      (* Fix VarXRef nodes to use direct variable names *)
-      let fixed_internals = List.map fix_varxref_stmt internals in
-      let internal_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent 1 interfaces) fixed_internals) in
-      
-      Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str internal_str
-  | [] -> generate_regular_module name stmts
-
-(* Find interface definition by name in the interface list *)
-and find_interface_by_name iface_name interfaces =
-  if !debug then Printf.printf "DEBUG: Looking for interface '%s' in %d interfaces\n" iface_name (List.length interfaces);
-  let result = List.find_opt (function
-    | Interface { name; _ } when name = iface_name -> 
-        if !debug then Printf.printf "DEBUG: Found interface '%s'\n" name;
-        true
-    | Interface { name; _ } -> 
-        if !debug then Printf.printf "DEBUG: Skipping interface '%s'\n" name;
-        false
-    | _ -> false
-  ) interfaces in
-  (match result with
-   | Some _ -> if !debug then Printf.printf "DEBUG: Successfully found interface '%s'\n" iface_name
-   | None -> if !debug then Printf.printf "DEBUG: Interface '%s' not found\n" iface_name);
-  result
-
-(* Generate cell connections based on module's interface references *)
-and generate_cell_connections_for_module pins module_stmts =
-  (* Extract interface info from the target module *)
-  let module_interface_refs = match module_stmts with
-    | Some (Module { stmts; _ }) -> extract_interface_refs stmts
-    | _ -> []
-  in
-  
-  List.fold_left (fun acc pin ->
-    match pin with
-    | Pin { expr = VarRef { name = "clk"; _ }; _ } -> 
-        ".clk(clk)" :: acc
-    | Pin { expr = VarRef { name = iface_name; _ }; _ } ->
-        (* Generate flattened connections based on the module's interface requirements *)
-        (match module_interface_refs with
-        | (_, _, _, Some (Modport { vars; _ })) :: _ ->
-            List.fold_left (fun conn_acc var ->
-              match var with
-              | ModportVarRef { name = var_name; _ } ->
-                  let flattened_name = Printf.sprintf "%s_%s" iface_name var_name in
-                  (Printf.sprintf ".%s(%s)" var_name flattened_name) :: conn_acc
-              | _ -> conn_acc
-            ) acc vars
-        | _ -> acc)
-    | _ -> acc
-  ) [] pins |> List.rev
-    

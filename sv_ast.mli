@@ -13,7 +13,7 @@ type sv_type =
   | RefType of { name: string; resolved: sv_type option }
   | VoidType of { name: string; resolved: sv_type option }
   | ArrayType of { base: sv_type; range: string }
-  | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option }
+  | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option; oldport:string }
   | UnknownType of string
 
 (* AST node types *)

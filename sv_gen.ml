@@ -1,108 +1,8 @@
 open Sv_ast
-open Sv_common
 
 let dump_sv_type = function
 | Some (IntfRefType {ifacename; modportname; ifacep; modportp}) -> ifacename^":"^modportname^":ifacep:modportp"
 | _ -> "unknown"
-
-(* Extract interface references from module statements *)
-let extract_interface_refs () =
-  let acc = ref [] in
-  Hashtbl.iter (fun _ stmt ->
-    match stmt with
-    | Var { name = var_name; dtype_ref; var_type = "IFACEREF"; dtype_name } ->
-        if false then print_endline ("Extract intf: \""^var_name^"\" ref "^dump_sv_type dtype_ref);
-        (* Parse dtype_ref to extract interface name and modport *)
-        (match dtype_ref with
-          | Some (IntfRefType { ifacename; modportname; ifacep; modportp }) ->
-			      if false then print_endline ifacename;
-			      let v = { interface_name = ifacename;
-			      modport_name = Some modportname;
-			      variable_name = var_name } in
-			      if not (List.mem v !acc) then acc := v :: !acc;
-	  | oth -> failwith "extract")
-    | _ -> ()
-  ) var_table;
-  !acc
-
-(* Get all modport names from an interface *)
-let get_interface_modports interface_stmts =
-  List.fold_left (fun acc stmt ->
-    match stmt with
-    | Modport { name; _ } -> name :: acc
-    | _ -> acc
-  ) [] interface_stmts
-
-(* Determine which modport to use for a module based on its interface usage *)
-let determine_modport_for_module module_name interface_name interface_stmts =
-  let available_modports = get_interface_modports interface_stmts in
-  match available_modports with
-  | [] -> None
-  | [single_modport] -> Some single_modport
-  | multiple_modports ->
-      (* Use heuristics based on module name if multiple modports exist *)
-      if String.contains module_name 'p' || 
-         String.contains module_name 'P' ||
-         List.exists (String.contains module_name) ['m'; 'M'] then
-        List.find_opt (fun mp -> 
-          String.contains mp 'm' || String.contains mp 'M' ||
-          String.contains mp 'p' || String.contains mp 'P'
-        ) multiple_modports |> 
-        (function None -> List.hd multiple_modports | Some mp -> mp) |> 
-        Option.some
-      else
-        List.find_opt (fun mp -> 
-          String.contains mp 's' || String.contains mp 'S' ||
-          String.contains mp 'c' || String.contains mp 'C'
-        ) multiple_modports |> 
-        (function None -> List.nth multiple_modports 1 | Some mp -> mp) |> 
-        Option.some
-
-(* Get modport directions with actual modport name *)
-let get_modport_directions interface_stmts modport_name =
-  let rec find_modport = function
-    | Modport { name; vars; _ } :: _ when name = modport_name ->
-        List.fold_left (fun acc var ->
-          match var with
-          | ModportVarRef { name; direction; _ } -> (name, direction) :: acc
-          | _ -> acc
-        ) [] vars
-    | _ :: rest -> find_modport rest
-    | [] -> []
-  in
-  find_modport interface_stmts
-
-(* Find interface by name in interface table *)
-let find_interface_by_name iface_name =
-  Hashtbl.fold (fun key interface acc ->
-    match interface with
-    | Interface { name; stmts; _ } when name = iface_name -> Some (name, stmts)
-    | _ -> acc
-  ) interface_table None
-
-(* Expand interface connections with dynamic lookup *)
-let expand_interface_connections iface_var_name module_name =
-  let interface_refs = extract_interface_refs () in
-  (* Find the interface reference for this variable *)
-  let iface_ref = List.find_opt (fun ref -> ref.variable_name = iface_var_name) interface_refs in
-  match iface_ref with
-  | Some { interface_name; modport_name; _ } ->
-      (match find_interface_by_name interface_name with
-      | Some (_, interface_stmts) ->
-          let actual_modport = match modport_name with
-            | Some mp -> mp
-            | None -> determine_modport_for_module module_name interface_name interface_stmts |> Option.value ~default:"default"
-          in
-          let directions = get_modport_directions interface_stmts actual_modport in
-          List.filter_map (fun (var_name, direction) ->
-            let flattened_name = Printf.sprintf "%s_%s" iface_var_name var_name in
-            Some (Printf.sprintf ".%s(%s)" var_name flattened_name)
-          ) directions
-      | None -> [])
-  | None -> []
-
-let is_flattened_module module_name = 
-  String.contains module_name 'p' || String.contains module_name 'c'
 
 (* Resolve type reference to actual type info *)
 let resolve_type dtype_ref =
@@ -161,7 +61,6 @@ let flatten_interface_to_ports interface_name interface_def =
   extract_signals interface_def.statements
 
 let nodelst = ref []
-let dbgdecls = ref []
 
 (* Generate SystemVerilog source from AST *)
 let rec generate_sv node indent =
@@ -184,11 +83,7 @@ let rec generate_sv node indent =
         | Var { var_type = "IFACEREF"; _ } -> true
         | _ -> false
       ) stmts in
-
-      if has_regular_ports && has_interface_refs then
-        (* Top module - generate flattened interface signals *)
-        generate_top_module name stmts
-      else if has_interface_refs then
+      if has_interface_refs then
         (* Child module with interface parameters *)
         generate_interface_module name stmts
       else
@@ -219,6 +114,7 @@ let rec generate_sv node indent =
         | Some (Module { name }) -> let module_name = name in
         (* Generate connections for module instantiations *)
         let pin_connections = List.fold_left (fun acc pin ->
+(*
           match pin with
           | Pin { expr = VarRef { name = "clk"; _ }; _ } -> 
               (* Direct clock connection *)
@@ -231,7 +127,9 @@ let rec generate_sv node indent =
           | Pin { expr = VarXRef { name = signal; dotted; _ }; _ } ->
               let flattened_name = Printf.sprintf "%s_%s" dotted signal in
               (Printf.sprintf ".%s(%s)" signal flattened_name) :: acc
-          | _ -> acc
+          | _ ->
+*)
+ acc
         ) [] pins in
 	    let connections = String.concat ", " (List.rev pin_connections) in
 	    Printf.sprintf "%s%s %s(%s);" ind module_name name connections
@@ -489,104 +387,9 @@ and generate_sv_indent indent node = generate_sv node indent
 
 (* Helper functions *)
 
-(* Updated generate_top_module function *)
-and generate_top_module name stmts =
-  let interface_refs = extract_interface_refs () in
-  let (regular_ports, cells, other_stmts) = 
-    List.fold_left (fun (ports, cells, others) stmt ->
-      match stmt with
-      | Var { var_type = "PORT"; _ } as v -> (v :: ports, cells, others)
-      | Var { var_type = "IFACEREF"; _ } -> (ports, cells, others) (* Skip interface refs *)
-      | Cell _ as c -> (ports, c :: cells, others)
-      | _ -> (ports, cells, stmt :: others)
-    ) ([], [], []) stmts in
-
-  (* Generate port declarations *)
-  let port_decls = List.map (fun v -> generate_sv v 1) regular_ports in
-  let port_str = String.concat ",\n" port_decls in
-
-  (* Generate interface signal declarations *)
-  let interface_signals = List.fold_left (fun acc iface_ref ->
-    match find_interface_by_name iface_ref.interface_name with
-    | Some (_, iface_stmts) ->
-        let signals = extract_interface_signals iface_ref.variable_name iface_stmts in
-        signals @ acc
-    | None -> acc
-  ) [] interface_refs in
-
-  let signal_decls = List.map (fun (sig_name, sig_type, _) ->
-    Printf.sprintf "  %s %s;" sig_type sig_name
-  ) interface_signals in
-
-  (* Generate input connections *)
-  let input_connections = List.filter_map (fun (sig_name, _, orig_name) ->
-    if orig_name = "clk" then
-      Some (Printf.sprintf "  assign %s = %s;" sig_name orig_name)
-    else None
-  ) interface_signals in
-
-  (* Filter and fix cell instantiations *)
-  let fixed_cells = List.filter_map (fun cell ->
-    match cell with
-    | Cell { modp_addr; _ } as c ->
-        let module_name = match modp_addr with
-          | Some (Module { name }) -> name
-	  | _ -> "" in
-        if Hashtbl.mem interface_table module_name then None
-        else Some (generate_sv c 1)
-    | _ -> Some (generate_sv cell 1)
-  ) cells in
-
-  dbgdecls := signal_decls :: !dbgdecls;
-  let body_parts = List.sort_uniq compare signal_decls @
-    List.sort_uniq compare input_connections @
-    fixed_cells @
-    List.map (generate_sv_indent 0) other_stmts in
-  let body = String.concat "\n" body_parts in
-
-  Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str body
-
-
 (* Updated generate_interface_module function *)
 and generate_interface_module name stmts =
-  let interface_refs = extract_interface_refs () in
-  match interface_refs with
-  | iface_ref :: _ ->
-      (match find_interface_by_name iface_ref.interface_name with
-      | Some (_, iface_stmts) ->
-          let modport_name = match iface_ref.modport_name with
-            | Some mp -> mp
-            | None -> determine_modport_for_module name iface_ref.interface_name iface_stmts |> Option.value ~default:"default"
-          in
-          let directions = get_modport_directions iface_stmts modport_name in
-
-          let flattened_ports = List.filter_map (fun (var_name, direction) ->
-            let port_dir = String.lowercase_ascii direction in
-            let var_info = List.find_opt (function
-              | Var { name; _ } when name = var_name -> true
-              | _ -> false
-            ) iface_stmts in
-            match var_info with
-            | Some (Var { dtype_ref; dtype_name; _ }) ->
-                let var_type = resolve_type_with_brackets dtype_name dtype_ref in
-                Some (Printf.sprintf "  %s %s %s" port_dir var_type var_name)
-            | _ -> None
-          ) directions in
-
-          let port_str = String.concat ",\n" flattened_ports in
-          
-          (* Generate module internals, filtering out IFACEREF vars *)
-          let filtered_stmts = List.filter (function
-            | Var { var_type = "IFACEREF"; _ } -> false
-            | _ -> true
-          ) stmts in
-          
-          let fixed_stmts = List.map (fix_varxref_in_stmt) filtered_stmts in
-          let internals = generate_internals fixed_stmts 1 in
-          
-          Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str internals
-      | None -> generate_regular_module name stmts)
-  | [] -> generate_regular_module name stmts
+ generate_regular_module name stmts
 
 and fix_varxref_in_stmt stmt =
   (* Recursively fix VarXRef nodes to use direct variable names *)

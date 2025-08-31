@@ -3,13 +3,5 @@
 #print_depth 1000000;;
 open Yojson;;
 open Sv_ast;;
-open Sv_common;;
+open Sv_parse;;
 open Sv_main;;
-let mods = ref [];;
-Hashtbl.iter (fun k x -> mods := (k,x) :: !mods) module_table;;
-let intf = ref [];;
-Hashtbl.iter (fun k x -> intf := (k,x) :: !intf) interface_table;;
-let typ = ref [];;
-Hashtbl.iter (fun k x -> typ := (k,x) :: !typ) type_table;;
-let jsn = ref [];;
-Hashtbl.iter (fun k x -> jsn := (k,x) :: !jsn) var_table;;

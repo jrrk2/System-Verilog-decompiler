@@ -162,4 +162,10 @@ and case_item = {
   statements: sv_node list;
 }
 
-type attr = {parent: string list }
+type attr = {
+  parent: string list;
+  type_table : (string, sv_type) Hashtbl.t;
+  interface_table : (string, sv_node) Hashtbl.t;
+  module_table : (string, sv_node) Hashtbl.t;
+  var_table : (string, sv_node) Hashtbl.t;
+ }

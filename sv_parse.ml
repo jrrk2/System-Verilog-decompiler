@@ -1,9 +1,8 @@
 open Sv_ast
-open Sv_common
 open Yojson.Basic.Util
 
 (* Parse type table entries *)
-let rec parse_type json =
+let rec parse_type attr json =
   let node_type = json |> member "type" |> to_string in
   
   match node_type with
@@ -37,7 +36,7 @@ let rec parse_type json =
         | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
         | _ -> ""
       in
-      let base_type = try Hashtbl.find type_table base_ref with Not_found -> UnknownType base_ref in
+      let base_type = try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType base_ref in
       ArrayType { base = base_type; range }
 
   | "IFACEREFDTYPE" ->
@@ -47,22 +46,22 @@ let rec parse_type json =
       let modportp = json |> member "modportp" |> to_string_option |> Option.value ~default:"" in
       IntfRefType { ifacename;
       modportname;
-      ifacep=Hashtbl.find_opt interface_table ifacep;
-      modportp=Hashtbl.find_opt interface_table modportp }
+      ifacep=Hashtbl.find_opt attr.interface_table ifacep;
+      modportp=Hashtbl.find_opt attr.interface_table modportp }
 
   | oth -> UnknownType node_type
 
 (* Parse type table and populate global table *)
-let rec parse_type_table json =
+let rec parse_type_table attr json =
   let types_json = json |> member "typesp" |> to_list in
   List.iter (fun type_json ->
     let addr = type_json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-    let parsed_type = parse_type type_json in
-    if addr <> "" then Hashtbl.add type_table addr parsed_type;
+    let parsed_type = parse_type attr type_json in
+    if addr <> "" then Hashtbl.add attr.type_table addr parsed_type;
     let modportp = type_json |> member "modportp" |> to_string_option |> Option.value ~default:"" in
-    if modportp <> "" then Hashtbl.add type_table modportp parsed_type;
+    if modportp <> "" then Hashtbl.add attr.type_table modportp parsed_type;
     let varp = type_json |> member "varp" |> to_string_option |> Option.value ~default:"" in
-    if varp <> "" then Hashtbl.add type_table varp parsed_type
+    if varp <> "" then Hashtbl.add attr.type_table varp parsed_type
   ) types_json
 
 let netlist = ref []
@@ -71,18 +70,17 @@ let netlist = ref []
 let rec parse_json attr json =
   let node_type = json |> member "type" |> to_string in
   let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-  if false then print_endline (node_type^":"^name);
   match node_type with
   | "NETLIST" ->
       (* Parse type table first *)
       let misc_list = json |> member "miscsp" |> to_list in
       List.iter (fun misc ->
         if (misc |> member "type" |> to_string) = "TYPETABLE" then
-          parse_type_table misc
+          parse_type_table attr misc
       ) misc_list;
       
       let modules = json |> member "modulesp" |> to_list |> List.map (parse' attr name) in
-      (* let type_list = Hashtbl.fold (fun k v acc -> (k, v) :: acc) type_table [] in *)
+      (* let type_list = Hashtbl.fold (fun k v acc -> (k, v) :: acc) attr.type_table [] in *)
       netlist := modules;
       Netlist modules
       
@@ -90,7 +88,7 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let m = Module { name; stmts } in
-      if addr <> "" then (print_endline (addr^":"^name); Hashtbl.add module_table addr m);
+      if addr <> "" then Hashtbl.add attr.module_table addr m;
       m
       
   | "PACKAGE" ->
@@ -102,17 +100,16 @@ let rec parse_json attr json =
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let interface_node = Interface { name; params = []; stmts } in
       if addr <> "" then (
-			  print_endline (addr^":"^name);
-			  Hashtbl.add interface_table addr interface_node;
-			  Hashtbl.add module_table addr interface_node
+			  Hashtbl.add attr.interface_table addr interface_node;
+			  Hashtbl.add attr.module_table addr interface_node
 			 );
-      Hashtbl.add interface_table name interface_node; (* Also store by name *)
+      Hashtbl.add attr.interface_table name interface_node; (* Also store by name *)
       interface_node
 
   | "CELL" ->
       let pins = json |> member "pinsp" |> to_list |> List.map (parse' attr name) in
       let modp_addr = json |> member "modp" |> to_string_option |> Option.value ~default:"" in
-      Cell { name; modp_addr=Hashtbl.find_opt module_table modp_addr; pins }
+      Cell { name; modp_addr=Hashtbl.find_opt attr.module_table modp_addr; pins }
       
   | "PIN" ->
       let expr = json |> member "exprp" |> to_list |> List.hd |> parse' attr name in
@@ -122,14 +119,14 @@ let rec parse_json attr json =
       let vars = json |> member "varsp" |> to_list |> List.map (parse' attr name) in
       let m = Modport { name; vars } in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-      if addr <> "" then Hashtbl.add interface_table addr m;
+      if addr <> "" then Hashtbl.add attr.interface_table addr m;
       m
       
   | "MODPORTVARREF" ->
       let direction = json |> member "direction" |> to_string_option |> Option.value ~default:"" in
       let var_ref = json |> member "varp" |> to_string_option |> Option.value ~default:"" in
       let m = ModportVarRef { name; direction; var_ref=attr.parent } in
-      Hashtbl.add var_table var_ref m;
+      Hashtbl.add attr.var_table var_ref m;
       m
             
   | "VAR" ->
@@ -147,24 +144,24 @@ let rec parse_json attr json =
           | [] -> None
         with _ -> None
       in
-      let typ = Hashtbl.find_opt type_table dtype_ref in
+      let typ = Hashtbl.find_opt attr.type_table dtype_ref in
       let v = Var { name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param } in
-      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add var_table nam v) [name;dtype_ref;addr] ;
+      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr] ;
       v
 									    
   | "CONST" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Const { name; dtype_ref=Hashtbl.find_opt type_table dtype_ref }
+      Const { name; dtype_ref=Hashtbl.find_opt attr.type_table dtype_ref }
       
   | "TYPEDEF" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Typedef { name; dtype_ref = Hashtbl.find_opt type_table dtype_ref }
+      Typedef { name; dtype_ref = Hashtbl.find_opt attr.type_table dtype_ref }
       
   | "FUNC" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
-      Func { name; dtype_ref = Hashtbl.find_opt type_table dtype_ref; stmts; vars }
+      Func { name; dtype_ref = Hashtbl.find_opt attr.type_table dtype_ref; stmts; vars }
       
   | "ALWAYS" ->
       let always = json |> member "keyword" |> to_string_option |> Option.value ~default:"always" in
@@ -286,4 +283,33 @@ let rec parse_json attr json =
       
   | oth -> Unknown (node_type, name)
 
-and parse' attr name = parse_json {parent=name::attr.parent}
+  and parse' attr name = parse_json ({attr with parent=name::attr.parent})
+
+let dbgpass1 = ref (Unknown ("",""))
+let dbgpass2 = ref (Unknown ("",""))
+let mods = ref []
+let intf = ref []
+let typ = ref []
+let vars = ref []
+
+let parse json =
+  let attr = 
+  {
+  parent=[];
+  type_table = Hashtbl.create 100;
+  interface_table = Hashtbl.create 20;
+  module_table = Hashtbl.create 20;
+  var_table = Hashtbl.create 20;
+  } in
+  dbgpass1 := parse_json attr json;
+  let ast = parse_json attr json in
+  dbgpass2 := ast;
+  mods := [];
+  Hashtbl.iter (fun k x -> mods := (k,x) :: !mods) attr.module_table;
+  intf := [];
+  Hashtbl.iter (fun k x -> intf := (k,x) :: !intf) attr.interface_table;
+  typ := [];
+  Hashtbl.iter (fun k x -> typ := (k,x) :: !typ) attr.type_table;
+  vars := [];
+  Hashtbl.iter (fun k x -> vars := (k,x) :: !vars) attr.var_table;
+  ast

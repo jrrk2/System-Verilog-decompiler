@@ -5,7 +5,7 @@ OCAMLMKTOP = ocamlmktop
 MENHIR = menhir
 OCAMLLEX = ocamllex
 
-SOURCES = sv_ast.mli sv_common.ml sv_parse.ml sv_gen.ml sv_main.ml
+SOURCES = sv_ast.mli sv_parse.ml sv_gen.ml sv_main.ml
 
 TARGET = json_verilog
 TARGET_TOP = json_verilog_top

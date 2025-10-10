@@ -48,7 +48,19 @@ let rec parse_type attr json =
       ifacep;
       modportp }
 
-  | oth -> UnknownType node_type
+  | "STRUCTDTYPE" ->
+      let name = json |> member "name" |> to_string in
+      let packed = json |> member "packed" |> to_bool in
+      let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
+      StructType { name; packed; members }
+
+  | "MEMBERDTYPE" ->
+      let name = json |> member "name" |> to_string in
+      let child = json |> member "childDTypep" |> to_list |> List.map (parse_type attr) in
+      let value = json |> member "valuep" |> to_list |> List.map (parse_type attr) in
+      MemberType { name; child; value }
+
+  | oth -> UnknownType (node_type, json )
 
 (* Parse type table and populate global table *)
 let rec parse_type_table attr json =
@@ -161,6 +173,12 @@ let rec parse_json attr json =
       let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
       Func' { name; dtype_ref; stmts; vars }
       
+  | "TASK" ->
+      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
+      Task' { name; dtype_ref; stmts; vars }
+      
   | "ALWAYS" ->
       let always = json |> member "keyword" |> to_string_option |> Option.value ~default:"always" in
       let senses = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
@@ -210,13 +228,13 @@ let rec parse_json attr json =
       let conditions = json |> member "condsp" |> to_list |> List.map (parse' attr name) in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       CaseItem { conditions; stmts }
-      
+(*      *)
   | "WHILE" ->
       let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let incs = json |> member "incsp" |> to_list |> List.map (parse' attr name) in
       While { condition; stmts; incs }
-      
+(* *)      
   | "VARREF" ->
       let access = json |> member "access" |> to_string_option |> Option.value ~default:"RD" in
       VarRef { name; access }
@@ -245,6 +263,14 @@ let rec parse_json attr json =
           with _ -> None
         ) in
       FuncRef { name; args }
+      
+  | "TASKREF" ->
+      let args = json |> member "pinsp" |> to_list |> 
+        List.filter_map (fun pin -> 
+          try Some (pin |> member "exprp" |> to_list |> List.hd |> parse' attr name)
+          with _ -> None
+        ) in
+      TaskRef { name; args }
       
   | "COND" ->
       let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
@@ -278,8 +304,74 @@ let rec parse_json attr json =
   | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" ->
       let operand = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       UnaryOp { op = node_type; operand }
-      
-  | oth -> Unknown (node_type, name)
+  | "EVENTCONTROL" ->
+      let sense = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      EventCtrl {sense; stmts}
+  | "INITIAL" ->
+      let suspend = json |> member "isSuspendable" |> to_bool in
+      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      Initial {suspend; stmts}
+
+  | "INITIALSTATIC" ->
+      let suspend = json |> member "isSuspendable" |> to_bool in
+      let process = json |> member "needProcess" |> to_bool in
+      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      InitialStatic {suspend; process; stmts}
+
+  | "DELAY" ->
+      let cycle = json |> member "isCycleDelay" |> to_bool in
+      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
+      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      Delay {cycle; lhs; stmts}
+
+  | "DISPLAY" ->
+      let fmt = json |> member "fmtp" |> to_list |> List.map (parse' attr name) in
+      let file = json |> member "filep" |> to_list |> List.map (parse' attr name) in
+      Display {fmt; file}
+
+  | "SFORMATF" ->
+      let expr = json |> member "exprsp" |> to_list |> List.map (parse' attr name) in
+      let scope = json |> member "scopeNamep" |> to_list |> List.map (parse' attr name) in
+      Sformatp {expr; scope}
+
+  | "SCOPENAME" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      ScopeName {dtype}
+
+  | "TIME" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      Time {dtype}
+
+  | "TEXT" ->
+      let text = json |> member "shortText" |> to_string in
+      Text {text}
+
+  | "SAMPLED" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let expr = json |> member "exprp" |> to_list |> List.map (parse' attr name) in
+      Sampled {dtype; expr}
+
+  | "CEXPR" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let expr = json |> member "exprsp" |> to_list |> List.map (parse' attr name) in
+      Cexpr {dtype; expr}
+
+  | "STMTEXPR" ->
+      let expr = json |> member "exprp" |> to_list |> List.hd |> parse' attr name in
+     StmtExpr {expr}
+
+  | "CONSPACKUORSTRUCT" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let members = json |> member "membersp" |> to_list |> List.map (parse' attr name) in
+     ConsPack' {dtype; members}
+
+  | "CONSPACKMEMBER" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+     ConsPackMember' {dtype; rhs}
+
+  | oth -> Unknown (node_type, json)
 
   and parse' attr name = parse_json ({attr with parent=name::attr.parent})
 
@@ -308,27 +400,86 @@ let rec rw attr = function
 | Modport { name; vars } -> Modport { name; vars=List.map (rw attr) vars }
 | ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
 | Const' { name; dtype_ref } ->
-  Const { name; dtype_ref=Hashtbl.find_opt attr.type_table dtype_ref }
+  Const { name; dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
 | Begin { name; stmts; is_generate } -> Begin { name; stmts=List.map (rw attr) stmts; is_generate }
 | Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
+| Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
+| EventCtrl { sense; stmts} -> EventCtrl {sense = List.map (rw attr) sense; stmts = List.map (rw attr) stmts}
+| Initial { suspend; stmts} -> Initial {suspend; stmts = List.map (rw attr) stmts}
+| InitialStatic { suspend; process; stmts} -> InitialStatic {suspend; process; stmts = List.map (rw attr) stmts}
+| Delay { cycle; lhs; stmts} -> Delay {cycle; lhs = rw attr lhs; stmts = List.map (rw attr) stmts}
+| While { condition; stmts; incs} -> While {condition = rw attr condition;
+stmts = List.map (rw attr) stmts;
+incs = List.map (rw attr) incs;}
+| UnaryOp {op; operand} -> UnaryOp { op; operand = rw attr operand; }
+| Cond {condition; then_val; else_val } -> Cond {condition = rw attr condition;
+    then_val = rw attr then_val;
+    else_val = rw attr else_val} 
+| If {condition; then_stmt; else_stmt } -> If {condition = rw attr condition;
+    then_stmt = rw attr then_stmt;
+    else_stmt = match else_stmt with Some stmt -> Some (rw attr stmt) | None -> None} 
+| ArraySel { expr; index } -> ArraySel { expr = rw attr expr; index = rw attr index }
+| FuncRef { name; args } -> FuncRef { name; args = List.map (rw attr) args }
+| TaskRef { name; args } -> TaskRef { name; args = List.map (rw attr) args }
+| Concat { parts } -> Concat { parts = List.map (rw attr) parts }
+| Display { fmt; file } -> Display { fmt=List.map (rw attr) fmt; file = List.map (rw attr) file }
+| Sformatp { expr; scope } -> Sformatp { expr=List.map (rw attr) expr; scope = List.map (rw attr) scope }
+| ScopeName { dtype } -> ScopeName { dtype }
+| Time { dtype } -> Time { dtype }
+| Text { text } -> Text { text }
+| Sampled { dtype; expr } -> Sampled { dtype; expr = List.map (rw attr) expr }
+| Cexpr { dtype; expr } -> Cexpr { dtype; expr = List.map (rw attr) expr }
+| StmtExpr { expr } -> StmtExpr { expr = rw attr expr }
+| Package { name; stmts } -> Package { name; stmts = List.map (rw attr) stmts }
+| Typedef' { name; dtype_ref } -> Typedef { name;
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
+| Typedef { name; dtype_ref } -> Typedef { name; dtype_ref } 
+| Func' { name; dtype_ref; stmts; vars } -> Func {
+      name;
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
+      stmts = List.map (rw attr) stmts ;
+      vars = List.map (rw attr) vars }
+| Func {
+      name;
+      dtype_ref;
+      stmts;
+      vars } -> Func {
+      name;
+      dtype_ref = rwtyp' attr dtype_ref;
+      stmts = List.map (rw attr) stmts;
+      vars = List.map (rw attr) vars }
+| Task' { name; dtype_ref; stmts; vars } -> Task {
+      name;
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
+      stmts = List.map (rw attr) stmts ;
+      vars = List.map (rw attr) vars }
+| Task {
+      name;
+      dtype_ref;
+      stmts;
+      vars } -> Task {
+      name;
+      dtype_ref = rwtyp' attr dtype_ref;
+      stmts = List.map (rw attr) stmts;
+      vars = List.map (rw attr) vars }
+| ConsPack' { dtype; members } -> ConsPack {
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
+      members = List.map (rw attr) members }
+| ConsPack { dtype_ref; members } -> ConsPack { dtype_ref; members = List.map (rw attr) members }
+| ConsPackMember' { dtype; rhs } -> ConsPackMember {
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
+      rhs = rw attr rhs }
+| ConsPackMember { dtype_ref; rhs } -> ConsPackMember { dtype_ref; rhs = rw attr rhs }
 | Const _
 | Cell _
 | Var _ as skip -> skip
-| Package _
-| Typedef' _
-| Typedef _
-| Func' _
-| Func _
-| If _
-| Case _
-| While _
-| ArraySel _
-| FuncRef _
-| UnaryOp _
-| Concat _
-| Cond _
 | CaseItem _
 | Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"
+
+and rwitm attr = function
+| { conditions; statements } -> {
+    conditions= List.map (rw attr) conditions;
+    statements = List.map (rw attr) statements }
 
 and rwopt attr = function
 | Some x -> Some (rw attr x)
@@ -340,7 +491,7 @@ and rwtyp' attr = function
 
 and rwtyp attr = function
 | ArrayType' { base=base_ref; range } ->
-  let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType base_ref) in
+  let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
   ArrayType { base = base_type; range }
 | IntfRefType' { ifacename; modportname; ifacep; modportp } ->
   IntfRefType { ifacename;
@@ -348,10 +499,14 @@ and rwtyp attr = function
   ifacep=Hashtbl.find_opt attr.interface_table ifacep;
   modportp=Hashtbl.find_opt attr.interface_table modportp }
 | BasicType _ as t -> t
+| RefType {name; resolved} as t -> t
+| EnumType {name; items} as t -> t
+| StructType { name; packed; members } -> StructType { name; packed; members = List.map (rwtyp attr) members }
+| MemberType { name; child; value } -> MemberType { name; child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
 | oth -> othrwtyp := Some oth; failwith "othrwtyp"
 
-let dbgpass1 = ref (Unknown ("",""))
-let dbgpass2 = ref (Unknown ("",""))
+let dbgpass1 = ref (Unknown ("",`Null))
+let dbgpass2 = ref (Unknown ("",`Null))
 let mods = ref []
 let intf = ref []
 let typ = ref []

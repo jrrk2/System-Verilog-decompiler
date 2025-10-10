@@ -9,14 +9,15 @@ type interface_ref = {
 type sv_type =
   | BasicType of { keyword: string; range: string option }
   | EnumType of { name: string; items: (string * string) list }
-  | StructType of { name: string; packed: bool; members: sv_type list }
+  | StructType of { name: string; packed: bool; members: sv_type list;  }
+  | MemberType of { name: string; child: sv_type list; value: sv_type list;  }
   | RefType of { name: string; resolved: sv_type option }
   | VoidType of { name: string; resolved: sv_type option }
   | ArrayType' of { base: string; range: string }
   | ArrayType of { base: sv_type; range: string }
   | IntfRefType' of { ifacename: string; modportname: string; ifacep: string; modportp: string }
   | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option }
-  | UnknownType of string
+  | UnknownType of string * Yojson.Basic.t
 
 (* AST node types *)
 and sv_node = 
@@ -103,6 +104,18 @@ and sv_node =
       stmts: sv_node list;
       vars: sv_node list;
     }
+  | Task' of {
+      name: string;
+      dtype_ref: string;
+      stmts: sv_node list;
+      vars: sv_node list;
+    }
+  | Task of {
+      name: string;
+      dtype_ref: sv_type option;
+      stmts: sv_node list;
+      vars: sv_node list;
+    }
   | Always of {
       always: string;
       senses: sv_node list;
@@ -159,6 +172,10 @@ and sv_node =
       name: string;
       args: sv_node list;
     }
+  | TaskRef of {
+      name: string;
+      args: sv_node list;
+    }
   | BinaryOp of {
       op: string;
       lhs: sv_node;
@@ -185,7 +202,69 @@ and sv_node =
       conditions: sv_node list;
       stmts: sv_node list;
     }
-  | Unknown of string * string
+  | Initial of {
+      suspend: bool;
+      stmts: sv_node list;
+    }
+  | InitialStatic of {
+      suspend: bool;
+      process: bool;
+      stmts: sv_node list;
+    }
+  | Delay of {
+      cycle: bool;
+      lhs: sv_node;
+      stmts: sv_node list;
+    }
+  | EventCtrl of {
+      sense: sv_node list;
+      stmts: sv_node list;
+    }
+  | Display of {
+      fmt: sv_node list;
+      file: sv_node list;
+    }  
+  | Sformatp of {
+      expr: sv_node list;
+      scope: sv_node list;
+    }
+  | ScopeName of {
+      dtype: string;
+      }
+  | Time of {
+      dtype: string;
+      }
+  | Text of {
+      text: string;
+      }
+  | Sampled of {
+      dtype: string;
+      expr: sv_node list;
+    }
+  | Cexpr of {
+      dtype: string;
+      expr: sv_node list;
+    }
+  | StmtExpr of {
+      expr: sv_node;
+    }
+  | ConsPack' of {
+      dtype: string;
+      members: sv_node list;
+    }
+  | ConsPack of {
+      dtype_ref: sv_type option;
+      members: sv_node list;
+    }
+  | ConsPackMember' of {
+      dtype: string;
+      rhs: sv_node;
+    }
+  | ConsPackMember of {
+      dtype_ref: sv_type option;
+      rhs: sv_node;
+    }
+  | Unknown of string * Yojson.Basic.t
 
 and case_item = {
   conditions: sv_node list;

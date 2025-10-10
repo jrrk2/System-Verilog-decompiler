@@ -1,6 +1,6 @@
 open Sv_ast
 
-let debug = ref true
+let debug = ref false  (* Set to false to reduce debug output *)
 
 let resolve_type = function
   | Some (RefType { name; _ }) -> name
@@ -11,13 +11,19 @@ let resolve_type = function
 
 let resolve_type_with_brackets dtype_name dtype_ref =
   let base_type = if dtype_name <> "" && dtype_name <> "logic" then dtype_name else resolve_type dtype_ref in
-  let fixed_type = Str.global_replace (Str.regexp "\\[\\[\\([^]]+\\)\\]\\]") "[\\1]" base_type in
-  if String.contains fixed_type ' ' && not (String.contains fixed_type '[') then
-    (match String.split_on_char ' ' fixed_type with
-    | [keyword; range] when String.contains range ':' -> 
-        Printf.sprintf "%s [%s]" keyword range
-    | _ -> fixed_type)
-  else fixed_type
+  (* Handle array types specially *)
+  match dtype_ref with
+  | Some (ArrayType { base; range }) ->
+      let base_str = resolve_type (Some base) in
+      Printf.sprintf "%s [%s]" base_str range
+  | _ ->
+      let fixed_type = Str.global_replace (Str.regexp "\\[\\[\\([^]]+\\)\\]\\]") "[\\1]" base_type in
+      if String.contains fixed_type ' ' && not (String.contains fixed_type '[') then
+	(match String.split_on_char ' ' fixed_type with
+	| [keyword; range] when String.contains range ':' -> 
+	    Printf.sprintf "%s [%s]" keyword range
+	| _ -> fixed_type)
+      else fixed_type
 
 (* Extract interface references from statements *)
 let extract_interface_refs stmts =
@@ -197,6 +203,22 @@ let unary_op_to_string = function
   | "EXTEND" -> ""  (* Type extension, usually implicit *)
   | op -> op
 
+(* Helper to extract struct members *)
+let extract_struct_members = function
+  | Some (StructType { members; _ }) ->
+      List.filter_map (function
+        | MemberType { name; child; _ } ->
+            let typ = match child with
+              | BasicType { keyword; range = Some r; _ } :: _ -> 
+                  Printf.sprintf "%s [%s]" keyword r
+              | BasicType { keyword; range = None; _ } :: _ -> keyword
+              | _ -> "logic"
+            in
+            Some (Printf.sprintf "    %s %s;" typ name)
+        | _ -> None
+      ) members
+  | _ -> []
+
 let rec generate_sv node indent =
   let ind = String.make (indent * 2) ' ' in
   match node with
@@ -264,7 +286,7 @@ let rec generate_sv node indent =
   | VarRef { name; _ } -> name
 
   | VarXRef { name; dotted; _ } ->
-      Printf.sprintf "%s_%s" dotted name
+      Printf.sprintf "%s.%s" dotted name
 
   | SenTree senses ->
       Printf.sprintf "@(%s)" 
@@ -289,7 +311,7 @@ let rec generate_sv node indent =
 
   | Begin { name; stmts; is_generate; _ } ->
       let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
-      if name <> "" && not (String.contains name '$') then
+      if name <> "" && not (String.contains name '$') && name <> "unnamedblk1" then
         Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
       else
         Printf.sprintf "%sbegin\n%s\n%send" ind stmt_str ind
@@ -327,7 +349,7 @@ let rec generate_sv node indent =
       let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
       let inc_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) incs) in
       if List.length incs > 0 then
-        Printf.sprintf "%swhile (%s) begin\n%s\n%s\n%send" ind cond_str stmt_str inc_str ind
+        Printf.sprintf "%sfor (; %s; ) begin\n%s\n%s\n%send" ind cond_str stmt_str inc_str ind
       else
         Printf.sprintf "%swhile (%s) begin\n%s\n%send" ind cond_str stmt_str ind
 
@@ -382,15 +404,19 @@ let rec generate_sv node indent =
   | EventCtrl { sense; stmts; _ } ->
       let sense_str = String.concat "" 
         (List.map (generate_sv_with_interfaces_indent 0 []) sense) in
-      let stmt_str = String.concat "\n"
-        (List.map (generate_sv_with_interfaces_indent indent []) stmts) in
-      Printf.sprintf "%s%s\n%s" ind sense_str stmt_str
+      let stmt_str = match stmts with
+        | [] -> ""
+        | _ -> "\n" ^ String.concat "\n" (List.map (generate_sv_with_interfaces_indent indent []) stmts)
+      in
+      Printf.sprintf "%s%s%s" ind sense_str stmt_str
 
   | Delay { cycle; lhs; stmts; _ } ->
       let delay_str = generate_sv_with_interfaces lhs 0 [] |> String.trim in
-      let stmt_str = String.concat "\n"
-        (List.map (generate_sv_with_interfaces_indent indent []) stmts) in
-      Printf.sprintf "%s#%s %s" ind delay_str stmt_str
+      let stmt_str = match stmts with
+        | [stmt] -> " " ^ (generate_sv_with_interfaces stmt 0 [] |> String.trim)
+        | _ -> " begin\n" ^ String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) ^ "\n" ^ ind ^ "end"
+      in
+      Printf.sprintf "%s#%s%s" ind delay_str stmt_str
 
   | Package { name; stmts; _ } ->
       let internal_str = String.concat "\n\n" 
@@ -400,12 +426,17 @@ let rec generate_sv node indent =
   | Typedef { name; dtype_ref; _ } ->
       let type_str = match dtype_ref with
         | Some (EnumType { items; _ }) ->
-            let items_str = String.concat ",\n    " 
+            let items_str = String.concat ",\n        " 
               (List.map (fun (n, v) -> Printf.sprintf "%s = %s" n v) items) in
-            Printf.sprintf "typedef enum logic [1:0] {\n    %s\n  } %s;" items_str name
+            Printf.sprintf "typedef enum logic [1:0] {\n        %s\n    } %s;" items_str name
         | Some (StructType { packed; members; name = struct_name; _ }) ->
             let pack_str = if packed then "packed " else "" in
-            Printf.sprintf "typedef %sstruct {\n    // members\n  } %s;" pack_str name
+            let members_str = extract_struct_members dtype_ref in
+            if List.length members_str > 0 then
+              Printf.sprintf "typedef %sstruct {\n%s\n    } %s;" pack_str 
+                (String.concat "\n" members_str) name
+            else
+              Printf.sprintf "typedef %sstruct {\n        // members\n    } %s;" pack_str name
         | Some typ -> Printf.sprintf "typedef %s %s;" (resolve_type (Some typ)) name
         | None -> Printf.sprintf "typedef ... %s;" name
       in
@@ -413,12 +444,32 @@ let rec generate_sv node indent =
 
   | Func { name; dtype_ref; stmts; vars; _ } ->
       let return_type = resolve_type dtype_ref in
-      let params_str = String.concat ", " 
-        (List.map (generate_sv_with_interfaces_indent 0 []) vars) in
+      
+      (* Separate return variable from input parameters *)
+      let inputs = List.filter (function
+        | Var { var_type = "PORT"; direction = "INPUT"; _ } -> true
+        | _ -> false
+      ) vars in
+      
+      (* Format input parameters *)
+      let params_str = if List.length inputs > 0 then
+        "\n" ^ (String.concat ";\n" 
+          (List.map (fun v -> 
+            match v with
+            | Var { name = vname; dtype_ref = vtype; dtype_name; _ } ->
+                let vtype_str = resolve_type_with_brackets dtype_name vtype in
+                Printf.sprintf "        input %s %s" vtype_str vname
+            | _ -> ""
+          ) inputs)) ^ ";\n"
+      else
+        ""
+      in
+      
       let body_str = String.concat "\n" 
-        (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
-      Printf.sprintf "%sfunction %s %s(%s);\n%s\n%sendfunction" 
-        ind return_type name params_str body_str ind
+        (List.map (generate_sv_with_interfaces_indent (indent + 2) []) stmts) in
+      
+      Printf.sprintf "%sfunction automatic %s %s(%s);\n%s%s\n%sendfunction" 
+        ind return_type name "" params_str body_str ind
 
   | Task { name; dtype_ref; stmts; vars; _ } ->
       let params_str = String.concat ", "
@@ -429,21 +480,38 @@ let rec generate_sv node indent =
         ind name params_str body_str ind
 
   | Display { fmt; file; _ } ->
-      let fmt_str = String.concat ", " 
-        (List.map (fun f -> generate_sv_with_interfaces f 0 [] |> String.trim) fmt) in
-      Printf.sprintf "%s$display(%s);" ind fmt_str
+      "" (* Skip display statements - they're assertions *)
 
   | Sformatp { expr; scope; _ } ->
-      let expr_str = String.concat ", "
-        (List.map (fun e -> generate_sv_with_interfaces e 0 [] |> String.trim) expr) in
-      Printf.sprintf "$sformatf(%s)" expr_str
+      "" (* Skip sformatf in assertions *)
 
-  | Text { text; _ } -> text
+  | Text { text; _ } -> ""  (* Skip text nodes *)
 
   | Time { dtype; _ } -> "$time"
 
   | StmtExpr { expr; _ } ->
       generate_sv_with_interfaces expr indent []
+
+  | Cexpr { dtype; expr; _ } ->
+      "" (* Skip Cexpr - used in assertions *)
+
+  | Sampled { dtype; expr; _ } ->
+      (* Extract the actual expression *)
+      (match expr with
+      | e :: _ -> generate_sv_with_interfaces e 0 []
+      | [] -> "")
+
+  | ScopeName { dtype; _ } ->
+      "" (* Skip scope names *)
+
+  | ConsPack { dtype_ref; members; _ } ->
+      (* Struct literal - generate '{field1, field2, ...} *)
+      let members_str = String.concat ", "
+        (List.map (generate_sv_with_interfaces_indent 0 []) members) in
+      Printf.sprintf "'{%s}" members_str
+
+  | ConsPackMember { dtype_ref; rhs; _ } ->
+      generate_sv_with_interfaces rhs 0 []
 
   | _ -> "/* Unhandled node */"
 
@@ -485,6 +553,14 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
       | Var { var_type = "PORT"; _ } as v -> (v :: ports, cells, others)
       | Var { var_type = "IFACEREF"; _ } -> (ports, cells, others)
       | Cell _ as c -> (ports, c :: cells, others)
+      | Always { always; senses; stmts = astmts; _ } as a ->
+          (* Filter out assertion always blocks *)
+          let has_display = List.exists (function
+            | Display _ -> true
+            | _ -> false
+          ) astmts in
+          if has_display then (ports, cells, others)
+          else (ports, cells, a :: others)
       | _ -> (ports, cells, stmt :: others)
     ) ([], [], []) stmts in
 
@@ -507,7 +583,8 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
             let mod_interface_refs = extract_interface_refs mod_stmts in
             (match mod_interface_refs with
             | (_, iface_name, _, modportp) :: _ ->
-                let interface_def = find_interface_by_name iface_name interfaces in
+                let interface_def = find_interface_by_name iface_name
+interfaces in
                 (* Extract the actual interface variable name from our interface_refs *)
                 let iface_var_name = match interface_refs with
                   | (var_name, _, _, _) :: _ -> var_name

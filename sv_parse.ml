@@ -62,6 +62,14 @@ let rec parse_type attr json =
 
   | oth -> UnknownType (node_type, json )
 
+let rec extract_const_value = function
+  | `Assoc fields ->
+      (try
+        let name = List.assoc "name" fields |> to_string in
+        name
+      with _ -> "/* const value */")
+  | _ -> "/* const value */"
+  
 (* Parse type table and populate global table *)
 let rec parse_type_table attr json =
   let types_json = json |> member "typesp" |> to_list in
@@ -139,7 +147,7 @@ let rec parse_json attr json =
       let m = ModportVarRef { name; direction; var_ref=attr.parent } in
       Hashtbl.add attr.var_table var_ref m;
       m
-            
+
   | "VAR" ->
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let dtype_name = json |> member "dtypeName" |> to_string_option |> Option.value ~default:"logic" in
@@ -148,16 +156,22 @@ let rec parse_json attr json =
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       let is_param = json |> member "isParam" |> to_bool_option |> Option.value ~default:false in
       let value = 
-        try 
-          let valuep = json |> member "valuep" |> to_list in
-          match valuep with
-          | v :: _ -> Some (parse' attr name v)
-          | [] -> None
-        with _ -> None
+	try 
+	  let valuep = json |> member "valuep" |> to_list in
+	  match valuep with
+	  | v :: _ -> 
+	      (* Try to extract constant value directly *)
+	      (try
+		let const_name = v |> member "name" |> to_string in
+		Some (Const { name = const_name; dtype_ref = None })
+	      with _ ->
+		Some (parse' attr name v))
+	  | [] -> None
+	with _ -> None
       in
       let v = Var' { name; dtype_ref; var_type; direction; value; dtype_name; is_param } in
-      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr] ;
-      v
+      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr];
+      v            
 									    
   | "CONST" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in

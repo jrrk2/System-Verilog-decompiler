@@ -470,10 +470,12 @@ incs = List.map (rw attr) incs;}
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
       rhs = rw attr rhs }
 | ConsPackMember { dtype_ref; rhs } -> ConsPackMember { dtype_ref; rhs = rw attr rhs }
+| CaseItem { conditions; stmts } -> CaseItem {
+      conditions = List.map (rw attr) conditions;
+      stmts = List.map (rw attr) stmts }
 | Const _
 | Cell _
 | Var _ as skip -> skip
-| CaseItem _
 | Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"
 
 and rwitm attr = function

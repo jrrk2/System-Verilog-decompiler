@@ -167,6 +167,36 @@ let fix_varxref_in_node top_level_ports iface_var_name node =
     | node -> node
   in fix_node node
 
+(* Binary operator conversion *)
+let binary_op_to_string = function
+  | "ADD" -> "+"
+  | "SUB" -> "-"
+  | "MUL" | "MULS" -> "*"
+  | "DIV" | "DIVS" -> "/"
+  | "POW" -> "**"
+  | "AND" -> "&"
+  | "OR" -> "|"
+  | "XOR" -> "^"
+  | "EQ" -> "=="
+  | "NEQ" -> "!="
+  | "LT" | "LTS" -> "<"
+  | "GT" | "GTS" -> ">"
+  | "LTE" -> "<="
+  | "GTE" -> ">="
+  | "SHIFTL" -> "<<"
+  | "SHIFTR" -> ">>"
+  | op -> op
+
+(* Unary operator conversion *)
+let unary_op_to_string = function
+  | "NOT" -> "!"
+  | "REDAND" -> "&"
+  | "REDOR" -> "|"
+  | "REDXOR" -> "^"
+  | "NEGATE" -> "-"
+  | "EXTEND" -> ""  (* Type extension, usually implicit *)
+  | op -> op
+
 let rec generate_sv node indent =
   let ind = String.make (indent * 2) ' ' in
   match node with
@@ -244,16 +274,176 @@ let rec generate_sv node indent =
       Printf.sprintf "%s %s" edge_str (generate_sv_with_interfaces signal 0 [] |> String.trim)
 
   | BinaryOp { op; lhs; rhs; _ } ->
-      let op_str = match op with
-        | "ADD" -> "+" | "SUB" -> "-" | "MUL" -> "*" | "DIV" -> "/"
-        | "AND" -> "&" | "OR" -> "|" | "XOR" -> "^"
-        | "EQ" -> "==" | "NEQ" -> "!=" | "LT" -> "<" | "GT" -> ">"
-        | _ -> op
-      in
+      let op_str = binary_op_to_string op in
       Printf.sprintf "(%s %s %s)" 
         (generate_sv_with_interfaces lhs 0 [] |> String.trim) op_str (generate_sv_with_interfaces rhs 0 [] |> String.trim)
 
+  | UnaryOp { op; operand; _ } ->
+      let op_str = unary_op_to_string op in
+      if op_str = "" then
+        generate_sv_with_interfaces operand 0 []
+      else
+        Printf.sprintf "%s(%s)" op_str (generate_sv_with_interfaces operand 0 [] |> String.trim)
+
   | Const { name; _ } -> name
+
+  | Begin { name; stmts; is_generate; _ } ->
+      let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+      if name <> "" && not (String.contains name '$') then
+        Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
+      else
+        Printf.sprintf "%sbegin\n%s\n%send" ind stmt_str ind
+
+  | If { condition; then_stmt; else_stmt; _ } ->
+      let cond_str = generate_sv_with_interfaces condition 0 [] |> String.trim in
+      let then_str = generate_sv_with_interfaces then_stmt indent [] in
+      let else_str = match else_stmt with
+        | Some stmt -> 
+            Printf.sprintf " else\n%s" (generate_sv_with_interfaces stmt indent [])
+        | None -> ""
+      in
+      Printf.sprintf "%sif (%s)\n%s%s" ind cond_str then_str else_str
+
+  | Case { expr; items; _ } ->
+      let expr_str = generate_sv_with_interfaces expr 0 [] |> String.trim in
+      let items_str = String.concat "\n" 
+        (List.map (fun item ->
+          match item.conditions with
+          | [] -> 
+              let stmt_str = String.concat "\n" 
+                (List.map (generate_sv_with_interfaces_indent (indent + 2) []) item.statements) in
+              Printf.sprintf "%s  default: begin\n%s\n%s  end" ind stmt_str ind
+          | conds ->
+              let cond_str = String.concat ", " 
+                (List.map (fun c -> generate_sv_with_interfaces c 0 [] |> String.trim) conds) in
+              let stmt_str = String.concat "\n" 
+                (List.map (generate_sv_with_interfaces_indent (indent + 2) []) item.statements) in
+              Printf.sprintf "%s  %s: begin\n%s\n%s  end" ind cond_str stmt_str ind
+        ) items) in
+      Printf.sprintf "%scase (%s)\n%s\n%sendcase" ind expr_str items_str ind
+
+  | While { condition; stmts; incs; _ } ->
+      let cond_str = generate_sv_with_interfaces condition 0 [] |> String.trim in
+      let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+      let inc_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) incs) in
+      if List.length incs > 0 then
+        Printf.sprintf "%swhile (%s) begin\n%s\n%s\n%send" ind cond_str stmt_str inc_str ind
+      else
+        Printf.sprintf "%swhile (%s) begin\n%s\n%send" ind cond_str stmt_str ind
+
+  | Sel { expr; lsb; width; range; _ } ->
+      let base = generate_sv_with_interfaces expr 0 [] |> String.trim in
+      (match lsb, width with
+      | Some l, Some w ->
+          Printf.sprintf "%s[%s +: %s]" base
+            (generate_sv_with_interfaces l 0 [] |> String.trim)
+            (generate_sv_with_interfaces w 0 [] |> String.trim)
+      | Some l, None ->
+          Printf.sprintf "%s[%s]" base (generate_sv_with_interfaces l 0 [] |> String.trim)
+      | None, None when range <> "" -> Printf.sprintf "%s[%s]" base range
+      | _ -> base)
+
+  | ArraySel { expr; index; _ } ->
+      Printf.sprintf "%s[%s]" 
+        (generate_sv_with_interfaces expr 0 [] |> String.trim)
+        (generate_sv_with_interfaces index 0 [] |> String.trim)
+
+  | FuncRef { name; args; _ } ->
+      let arg_str = String.concat ", " 
+        (List.map (fun a -> generate_sv_with_interfaces a 0 [] |> String.trim) args) in
+      Printf.sprintf "%s(%s)" name arg_str
+
+  | TaskRef { name; args; _ } ->
+      let arg_str = String.concat ", "
+        (List.map (fun a -> generate_sv_with_interfaces a 0 [] |> String.trim) args) in
+      Printf.sprintf "%s%s(%s);" ind name arg_str
+
+  | Concat { parts; _ } ->
+      let parts_str = String.concat ", "
+        (List.map (fun p -> generate_sv_with_interfaces p 0 [] |> String.trim) parts) in
+      Printf.sprintf "{%s}" parts_str
+
+  | Cond { condition; then_val; else_val; _ } ->
+      Printf.sprintf "(%s ? %s : %s)"
+        (generate_sv_with_interfaces condition 0 [] |> String.trim)
+        (generate_sv_with_interfaces then_val 0 [] |> String.trim)
+        (generate_sv_with_interfaces else_val 0 [] |> String.trim)
+
+  | Initial { suspend; stmts; _ } ->
+      let stmt_str = String.concat "\n" 
+        (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+      Printf.sprintf "%sinitial begin\n%s\n%send" ind stmt_str ind
+
+  | InitialStatic { suspend; process; stmts; _ } ->
+      let stmt_str = String.concat "\n"
+        (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+      Printf.sprintf "%sinitial begin\n%s\n%send" ind stmt_str ind
+
+  | EventCtrl { sense; stmts; _ } ->
+      let sense_str = String.concat "" 
+        (List.map (generate_sv_with_interfaces_indent 0 []) sense) in
+      let stmt_str = String.concat "\n"
+        (List.map (generate_sv_with_interfaces_indent indent []) stmts) in
+      Printf.sprintf "%s%s\n%s" ind sense_str stmt_str
+
+  | Delay { cycle; lhs; stmts; _ } ->
+      let delay_str = generate_sv_with_interfaces lhs 0 [] |> String.trim in
+      let stmt_str = String.concat "\n"
+        (List.map (generate_sv_with_interfaces_indent indent []) stmts) in
+      Printf.sprintf "%s#%s %s" ind delay_str stmt_str
+
+  | Package { name; stmts; _ } ->
+      let internal_str = String.concat "\n\n" 
+        (List.map (generate_sv_with_interfaces_indent 1 []) stmts) in
+      Printf.sprintf "package %s;\n%s\nendpackage" name internal_str
+
+  | Typedef { name; dtype_ref; _ } ->
+      let type_str = match dtype_ref with
+        | Some (EnumType { items; _ }) ->
+            let items_str = String.concat ",\n    " 
+              (List.map (fun (n, v) -> Printf.sprintf "%s = %s" n v) items) in
+            Printf.sprintf "typedef enum logic [1:0] {\n    %s\n  } %s;" items_str name
+        | Some (StructType { packed; members; name = struct_name; _ }) ->
+            let pack_str = if packed then "packed " else "" in
+            Printf.sprintf "typedef %sstruct {\n    // members\n  } %s;" pack_str name
+        | Some typ -> Printf.sprintf "typedef %s %s;" (resolve_type (Some typ)) name
+        | None -> Printf.sprintf "typedef ... %s;" name
+      in
+      Printf.sprintf "%s%s" ind type_str
+
+  | Func { name; dtype_ref; stmts; vars; _ } ->
+      let return_type = resolve_type dtype_ref in
+      let params_str = String.concat ", " 
+        (List.map (generate_sv_with_interfaces_indent 0 []) vars) in
+      let body_str = String.concat "\n" 
+        (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+      Printf.sprintf "%sfunction %s %s(%s);\n%s\n%sendfunction" 
+        ind return_type name params_str body_str ind
+
+  | Task { name; dtype_ref; stmts; vars; _ } ->
+      let params_str = String.concat ", "
+        (List.map (generate_sv_with_interfaces_indent 0 []) vars) in
+      let body_str = String.concat "\n"
+        (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+      Printf.sprintf "%stask %s(%s);\n%s\n%sendtask"
+        ind name params_str body_str ind
+
+  | Display { fmt; file; _ } ->
+      let fmt_str = String.concat ", " 
+        (List.map (fun f -> generate_sv_with_interfaces f 0 [] |> String.trim) fmt) in
+      Printf.sprintf "%s$display(%s);" ind fmt_str
+
+  | Sformatp { expr; scope; _ } ->
+      let expr_str = String.concat ", "
+        (List.map (fun e -> generate_sv_with_interfaces e 0 [] |> String.trim) expr) in
+      Printf.sprintf "$sformatf(%s)" expr_str
+
+  | Text { text; _ } -> text
+
+  | Time { dtype; _ } -> "$time"
+
+  | StmtExpr { expr; _ } ->
+      generate_sv_with_interfaces expr indent []
 
   | _ -> "/* Unhandled node */"
 
@@ -392,7 +582,7 @@ and generate_regular_module name stmts top_level_ports =
     | _ -> true
   ) stmts in
   
-  let port_str = if ports = [] then "" else Printf.sprintf " (\n%s\n)" (String.concat ",\n  " ports) in
+  let port_str = if ports = [] then "" else Printf.sprintf " (\n  %s\n)" (String.concat ",\n  " ports) in
   let internal_str = String.concat "\n" (List.map (generate_sv_indent 1) internals) in
   
   Printf.sprintf "module %s%s;\n%s\nendmodule" name port_str internal_str
@@ -416,4 +606,3 @@ and generate_cell_connections pins module_def top_level_ports =
   | [Pin { expr = VarRef { name = "clk"; _ }; _ }] -> [".clk(clk)"]
   | [Pin { expr = VarRef { name; _ }; _ }] -> [Printf.sprintf ".sif(%s)" name]  
   | _ -> []
-  

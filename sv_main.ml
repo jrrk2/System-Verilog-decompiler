@@ -10,8 +10,9 @@ let translate_tree_to_ast json_file =
   jsontree := json;
   Sv_parse.parse json
 
-let () =
-    (try
+let asthash = Hashtbl.create 255
+
+let scan () =
       let obj = "obj_dir/" in
       let rslt = "results/" in
       (try Unix.mkdir rslt 0o750 with e -> Printf.eprintf "%s: %s\n" rslt (Printexc.to_string e));
@@ -22,12 +23,8 @@ let () =
 	   done with End_of_file -> Unix.closedir fd);
       List.iter (fun itm ->
       let ast = translate_tree_to_ast (obj^itm) in
+      Hashtbl.add asthash itm ast;
       let result = Sv_gen.generate_sv ast 0 in
       let fd = open_out (rslt^"decompile_"^itm^".sv") in
       output_string fd result;
-      close_out fd) !lst;
-    with
-    | Sys_error msg -> Printf.eprintf "Error: %s\n" msg
-    | Yojson.Json_error msg -> Printf.eprintf "JSON Error: %s\n" msg
-    | e -> Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string e));
-    flush stderr
+      close_out fd) !lst

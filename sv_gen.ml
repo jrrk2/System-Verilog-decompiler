@@ -17,16 +17,16 @@ let rec resolve_array_type = function
   | dtype -> resolve_type dtype
 
 let resolve_type_with_brackets dtype_name dtype_ref =
-  (* Handle array types specially *)
+  (* Handle array types specially - the range goes AFTER the variable name *)
   match dtype_ref with
-  | Some (ArrayType { base; range }) ->
-      let base_str = match base with
-        | BasicType { keyword; range = Some r; _ } -> keyword ^ " [" ^ r ^ "]"
-        | BasicType { keyword; range = None; _ } -> keyword
-        | RefType { name; _ } -> name
-        | _ -> if dtype_name <> "" then dtype_name else "logic"
-      in
-      Printf.sprintf "%s [%s]" base_str range
+  | Some (ArrayType _) ->
+      (* For arrays, return just the base type; range handled separately *)
+      if dtype_name <> "" && dtype_name <> "logic" then 
+        dtype_name 
+      else 
+        (match dtype_ref with
+        | Some (ArrayType { base; _ }) -> resolve_type (Some base)
+        | _ -> "logic")
   | _ ->
       let base_type = if dtype_name <> "" && dtype_name <> "logic" then dtype_name else resolve_type dtype_ref in
       let fixed_type = Str.global_replace (Str.regexp "\\[\\[\\([^]]+\\)\\]\\]") "[\\1]" base_type in
@@ -212,12 +212,14 @@ let unary_op_to_string = function
 let rec extract_struct_members = function
   | Some (StructType { members; _ }) ->
       List.filter_map (function
-        | MemberType { name; child; _ } ->
-            let typ = match child with
-              | BasicType { keyword; range = Some r; _ } :: _ -> 
+        | MemberType { name; dtype_ref; _ } ->
+            (* Use dtype_ref instead of child *)
+            let typ = match dtype_ref with
+              | Some (BasicType { keyword; range = Some r; _ }) -> 
                   Printf.sprintf "%s [%s]" keyword r
-              | BasicType { keyword; range = None; _ } :: _ -> keyword
-              | RefType { name = tname; _ } :: _ -> tname
+              | Some (BasicType { keyword; range = None; _ }) -> keyword
+              | Some (RefType { name = tname; _ }) -> tname
+              | None -> "logic"
               | _ -> "logic"
             in
             Some (Printf.sprintf "    %s %s;" typ name)
@@ -252,24 +254,60 @@ let rec generate_sv node indent =
       | _ -> Printf.sprintf "%s// Unknown cell %s" ind name)
 
   | Var { name; dtype_ref; var_type; direction; value; dtype_name; is_param; _ } ->
-      let resolved_type = resolve_type_with_brackets dtype_name dtype_ref in
-      let prefix = match var_type with
-        | "LPARAM" -> "localparam"
-        | "GPARAM" -> "parameter"
-        | "PORT" -> String.lowercase_ascii direction
-        | "GENVAR" -> "genvar"
-        | _ -> if is_param then "parameter" else ""
-      in
-      let val_str = match value with
-        | Some v -> " = " ^ (generate_sv_with_interfaces v 0 [] |> String.trim)
-        | None -> ""
-      in
-      if var_type = "PORT" then
-        Printf.sprintf "%s %s %s%s" prefix resolved_type name val_str
-      else if prefix <> "" then
-        Printf.sprintf "%s%s %s %s%s;" ind prefix resolved_type name val_str
-      else
-        Printf.sprintf "%s%s %s%s;" ind resolved_type name val_str
+	let resolved_type = resolve_type_with_brackets dtype_name dtype_ref in
+
+        (* Extract array range if present - convert hex to proper range *)
+	let array_range = match dtype_ref with
+	  | Some (ArrayType { range; _ }) -> 
+	      (* Handle various range formats *)
+	      if String.contains range ':' then
+		" [" ^ range ^ "]"
+	      else
+		(* Single value like "32'h0" or "32'hff" - interpret as upper bound *)
+		let parse_verilog_const s =
+		  try
+		    (* Remove bit width prefix like "32'h" *)
+		    let parts = Str.split (Str.regexp "'") s in
+		    match parts with
+		    | [_; rest] ->
+			(* Extract the value part after 'h, 'd, 'b, etc *)
+			let value_str = if String.length rest > 0 then
+			  String.sub rest 1 (String.length rest - 1)
+			else "0" in
+			(* Convert hex to decimal *)
+			if String.get rest 0 = 'h' then
+			  int_of_string ("0x" ^ value_str)
+			else if String.get rest 0 = 'd' then
+			  int_of_string value_str
+			else
+			  int_of_string value_str
+		    | _ -> 0
+		  with _ -> 255  (* Default fallback *)
+		in
+		let upper = parse_verilog_const range in
+		(* For memory, calculate actual size: 2^ADDR_WIDTH *)
+		let size = if upper = 0 then 255 else upper in
+		Printf.sprintf " [0:%d]" size
+	  | _ -> ""
+	  in
+	
+	let prefix = match var_type with
+	  | "LPARAM" -> "localparam"
+	  | "GPARAM" -> "parameter"
+	  | "PORT" -> String.lowercase_ascii direction
+	  | "GENVAR" -> "genvar"
+	  | _ -> if is_param then "parameter" else ""
+	in
+	let val_str = match value with
+	  | Some v -> " = " ^ (generate_sv_with_interfaces v 0 [] |> String.trim)
+	  | None -> ""
+	in
+	if var_type = "PORT" then
+	  Printf.sprintf "%s %s %s%s%s" prefix resolved_type name array_range val_str
+	else if prefix <> "" then
+	  Printf.sprintf "%s%s %s %s%s%s;" ind prefix resolved_type name array_range val_str
+	else
+	Printf.sprintf "%s%s %s%s%s;" ind resolved_type name array_range val_str
 
   | Always { always; senses; stmts; _ } ->
       let sense_str = match senses with
@@ -315,13 +353,32 @@ let rec generate_sv node indent =
   | Const { name; _ } -> name
 
   | Begin { name; stmts; is_generate; _ } ->
-      let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
-      if name <> "" && not (String.contains name '$') && 
-         not (String.contains name '[') && (* Skip indexed generate blocks *)
-         name <> "unnamedblk1" then
-        Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
-      else
-        Printf.sprintf "%sbegin\n%s\n%send" ind stmt_str ind
+	let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
+
+	(* Check if this is a generate block with indexed children *)
+	let has_indexed_children = List.exists (function
+	  | Begin { name = child_name; _ } when String.contains child_name '[' -> true
+	  | _ -> false
+	) stmts in
+
+	if name <> "" && not (String.contains name '$') && 
+	   not (String.contains name '[') && (* This is not an indexed block itself *)
+	   name <> "unnamedblk1" then
+	  if is_generate then
+	    (* Generate block with potential children *)
+	    if has_indexed_children && List.length stmts > 0 then
+	      (* Has indexed children - include them *)
+	      Printf.sprintf "%sgenerate\n%s  for (genvar i = 0; i < 2; i++) begin : %s\n%s\n%s  end\n%sendgenerate" 
+		ind ind name stmt_str ind ind
+	    else
+	      Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
+	  else
+	    Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
+	else if String.contains name '[' then
+	  (* This is an indexed generate block child *)
+	  Printf.sprintf "%s// Generate block instance %s\n%s" ind name stmt_str
+	else
+	  Printf.sprintf "%sbegin\n%s\n%send" ind stmt_str ind
 
   | If { condition; then_stmt; else_stmt; _ } ->
       let cond_str = generate_sv_with_interfaces condition 0 [] |> String.trim in
@@ -450,33 +507,35 @@ let rec generate_sv node indent =
       Printf.sprintf "%s%s" ind type_str
 
   | Func { name; dtype_ref; stmts; vars; _ } ->
-      let return_type = resolve_type dtype_ref in
-      
-      (* Separate return variable from input parameters *)
-      let inputs = List.filter (function
-        | Var { var_type = "PORT"; direction = "INPUT"; _ } -> true
-        | _ -> false
-      ) vars in
-      
-      (* Format input parameters *)
-      let params_str = String.concat ";\n" 
-        (List.map (fun v ->
-          match v with
-          | Var { name = vname; dtype_ref = vtype; dtype_name; _ } ->
-              let vtype_str = resolve_type_with_brackets dtype_name vtype in
-              Printf.sprintf "input %s %s" vtype_str vname
-          | _ -> ""
-        ) inputs) in
-      
-      let body_str = String.concat "\n" 
-        (List.map (generate_sv_with_interfaces_indent (indent + 2) []) stmts) in
-      
-      if List.length inputs > 0 then
-        Printf.sprintf "%sfunction automatic %s %s();\n%s;\n%s\n%sendfunction" 
-          ind return_type name params_str body_str ind
-      else
-        Printf.sprintf "%sfunction automatic %s %s();\n%s\n%sendfunction" 
-          ind return_type name body_str ind
+	let return_type = resolve_type dtype_ref in
+
+	(* Separate return variable from input parameters *)
+	let inputs = List.filter (function
+	  | Var { var_type = "PORT"; direction = "INPUT"; _ } -> true
+	  | _ -> false
+	) vars in
+
+	(* Format input parameters with proper newlines and semicolons *)
+	let params_str = 
+	  if List.length inputs > 0 then
+	    "\n" ^
+	    (String.concat "\n" (List.map (fun v ->
+	      match v with
+	      | Var { name = vname; dtype_ref = vtype; dtype_name; _ } ->
+		  let vtype_str = resolve_type_with_brackets dtype_name vtype in
+		  Printf.sprintf "        input %s %s;" vtype_str vname
+	      | _ -> ""
+	    ) inputs)) ^
+	    "\n"
+	  else
+	    ""
+	in
+
+	let body_str = String.concat "\n" 
+	  (List.map (generate_sv_with_interfaces_indent (indent + 2) []) stmts) in
+
+	Printf.sprintf "%sfunction automatic %s %s();%s%s\n%sendfunction" 
+	  ind return_type name params_str body_str ind
 
   | Task { name; dtype_ref; stmts; vars; _ } ->
       let params_str = String.concat ", "
@@ -549,12 +608,13 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
     | _ -> acc
   ) [] stmts in
   
-  let (regular_ports, cells, other_stmts) = 
-    List.fold_left (fun (ports, cells, others) stmt ->
+  (* Separate statements, keeping generate blocks together *)
+  let (regular_ports, cells, gen_blocks, other_stmts) = 
+    List.fold_left (fun (ports, cells, gens, others) stmt ->
       match stmt with
-      | Var { var_type = "PORT"; _ } as v -> (v :: ports, cells, others)
-      | Var { var_type = "IFACEREF"; _ } -> (ports, cells, others)
-      | Cell _ as c -> (ports, c :: cells, others)
+      | Var { var_type = "PORT"; _ } as v -> (v :: ports, cells, gens, others)
+      | Var { var_type = "IFACEREF"; _ } -> (ports, cells, gens, others)
+      | Cell _ as c -> (ports, c :: cells, gens, others)
       | Always { always; senses; stmts = astmts; _ } as a ->
           (* Filter out assertion always blocks *)
           let has_display = List.exists (function
@@ -562,14 +622,13 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
             | If { condition = Cexpr _; _ } -> true
             | _ -> false
           ) astmts in
-          if has_display then (ports, cells, others)
-          else (ports, cells, a :: others)
-      | Begin { name = bname; stmts = bstmts; is_generate; _ } as b ->
-          (* Filter out indexed generate blocks - they should be inside parent *)
-          if String.contains bname '[' then (ports, cells, others)
-          else (ports, cells, b :: others)
-      | _ -> (ports, cells, stmt :: others)
-    ) ([], [], []) stmts in
+          if has_display then (ports, cells, gens, others)
+          else (ports, cells, gens, a :: others)
+      | Begin { name = bname; is_generate = true; _ } as b ->
+          (* Keep all generate blocks together *)
+          (ports, cells, b :: gens, others)
+      | _ -> (ports, cells, gens, stmt :: others)
+    ) ([], [], [], []) stmts in
 
   let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) regular_ports in
   
@@ -601,6 +660,9 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
     | _ -> ""
   ) cells in
 
+  (* Process generate blocks - keep parent and children together *)
+  let gen_stmts = List.map (generate_sv_with_interfaces_indent 1 interfaces) (List.rev gen_blocks) in
+
   let other_assigns = List.map (fun stmt ->
     match stmt with
     | AssignW { lhs; rhs } ->
@@ -619,7 +681,7 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
   ) other_stmts in
 
   let port_str = String.concat ",\n" port_decls in
-  let body_parts = signal_decls @ cell_stmts @ other_assigns in
+  let body_parts = signal_decls @ cell_stmts @ gen_stmts @ other_assigns in
   let body = String.concat "\n" (List.filter (fun s -> s <> "") body_parts) in
 
   Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str body
@@ -668,11 +730,11 @@ and find_interface_by_name iface_name interfaces =
 
 and extract_iface_var_name_from_pins pins =
   match pins with
-  | Pin { expr = VarRef { name; _ }; _ } :: _ when name <> "clk" -> name
+  | Pin { expr = Some (VarRef { name; _ }); _ } :: _ when name <> "clk" -> name
   | _ -> "sif"
 
 and generate_cell_connections pins module_def top_level_ports =
   match pins with
-  | [Pin { expr = VarRef { name = "clk"; _ }; _ }] -> [".clk(clk)"]
-  | [Pin { expr = VarRef { name; _ }; _ }] -> [Printf.sprintf ".sif(%s)" name]  
+  | [Pin { expr = Some (VarRef { name = "clk"; _ }); _ }] -> [".clk(clk)"]
+  | [Pin { expr = Some (VarRef { name; _ }); _ }] -> [Printf.sprintf ".sif(%s)" name]  
   | _ -> []

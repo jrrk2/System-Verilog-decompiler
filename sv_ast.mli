@@ -10,13 +10,19 @@ type sv_type =
   | BasicType of { keyword: string; range: string option }
   | EnumType of { name: string; items: (string * string) list }
   | StructType of { name: string; packed: bool; members: sv_type list;  }
-  | MemberType of { name: string; child: sv_type list; value: sv_type list;  }
+  | UnionType of { name: string; packed: bool; members: sv_type list;  }
+  | MemberType' of { name: string; dtype: string; child: sv_type list; value: sv_type list;  }
+  | MemberType of { name: string; dtype_ref: sv_type option; child: sv_type list; value: sv_type list;  }
   | RefType of { name: string; resolved: sv_type option }
   | VoidType of { name: string; resolved: sv_type option }
   | ArrayType' of { base: string; range: string }
   | ArrayType of { base: sv_type; range: string }
+  | PackArrayType' of { base: string; range: string }
+  | PackArrayType of { base: sv_type; range: string }
   | IntfRefType' of { ifacename: string; modportname: string; ifacep: string; modportp: string }
   | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option }
+  | ConstType' of {name: string; dtype: string; child: sv_type list }
+  | ConstType of {name: string; dtype_ref: sv_type option; child: sv_type list }
   | UnknownType of string * Yojson.Basic.t
 
 (* AST node types *)
@@ -47,7 +53,7 @@ and sv_node =
     }
   | Pin of {
       name: string;
-      expr: sv_node;
+      expr: sv_node option;
     }
   | Modport of {
       name: string;
@@ -126,6 +132,20 @@ and sv_node =
       stmts: sv_node list;
       is_generate: bool;
     }
+  | Replicate' of {
+      dtype: string;
+      src: sv_node;
+      count: sv_node;
+    }
+  | Replicate of {
+      dtype_ref: sv_type option;
+      src: sv_node;
+      count: sv_node;
+    }
+  | InsideRange of {
+      lhs: sv_node;
+      rhs: sv_node;
+    }
   | Assign of {
       lhs: sv_node;
       rhs: sv_node;
@@ -202,11 +222,34 @@ and sv_node =
       conditions: sv_node list;
       stmts: sv_node list;
     }
+  | Stop of {
+      fatal: bool
+    }
+  | JumpBlock of {
+      stmt: sv_node list;
+    }
+  | JumpGo' of {
+      label: string
+    }
+  | JumpGo of {
+      label: sv_type option;
+    }
+  | InitArray of {
+      inits: sv_node list;
+    }
+  | InitItem of {
+      value: sv_node list;
+    }
   | Initial of {
       suspend: bool;
       stmts: sv_node list;
     }
   | InitialStatic of {
+      suspend: bool;
+      process: bool;
+      stmts: sv_node list;
+    }
+  | Final of {
       suspend: bool;
       process: bool;
       stmts: sv_node list;
@@ -220,9 +263,42 @@ and sv_node =
       sense: sv_node list;
       stmts: sv_node list;
     }
+  | Fopen' of {
+      dtype: string;
+      filename: sv_node list;
+      mode: sv_node list;
+    }  
+  | Fopen of {
+      dtype_ref: sv_type option;
+      filename: sv_node list;
+      mode: sv_node list;
+    }  
+  | Fclose of {
+      file: sv_node list;
+    }  
+  | Itord' of {
+      dtype: string;
+      lhs: sv_node list;
+    }  
+  | Itord of {
+      dtype_ref: sv_type option;
+      lhs: sv_node list;
+    }  
+  | CvtPackString' of {
+      dtype: string;
+      lhs: sv_node list;
+    }  
+  | CvtPackString of {
+      dtype_ref: sv_type option;
+      lhs: sv_node list;
+    }  
   | Display of {
       fmt: sv_node list;
       file: sv_node list;
+    }  
+  | Sformat of {
+      fmt: sv_node list;
+      lhs: sv_node list;
     }  
   | Sformatp of {
       expr: sv_node list;
@@ -248,6 +324,16 @@ and sv_node =
   | StmtExpr of {
       expr: sv_node;
     }
+  | CMethodHard' of {
+      dtype: string;
+      from: sv_node;
+      pins: sv_node list;
+    }
+  | CMethodHard of {
+      dtype_ref: sv_type option;
+      from: sv_node;
+      pins: sv_node list;
+    }
   | ConsPack' of {
       dtype: string;
       members: sv_node list;
@@ -263,6 +349,24 @@ and sv_node =
   | ConsPackMember of {
       dtype_ref: sv_type option;
       rhs: sv_node;
+    }
+  | ValuePlusArgs' of {
+      dtype: string;
+      search: sv_node list;
+      out: sv_node list;
+    }
+  | ValuePlusArgs of {
+      dtype_ref: sv_type option;
+      search: sv_node list;
+      out: sv_node list;
+    }
+  | TestPlusArgs' of {
+      dtype: string;
+      search: sv_node list;
+    }
+  | TestPlusArgs of {
+      dtype_ref: sv_type option;
+      search: sv_node list;
     }
   | Unknown of string * Yojson.Basic.t
 

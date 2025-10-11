@@ -1,7 +1,7 @@
 # Alternative Makefile for manual building
 OCAMLC = ocamlc
-OCAMLOPT = ocamlopt
-OCAMLMKTOP = ocamlmktop
+OCAMLOPT = ocamlopt -g
+OCAMLMKTOP = ocamlmktop -g
 MENHIR = menhir
 OCAMLLEX = ocamllex
 
@@ -13,9 +13,6 @@ TARGET_TOP = json_verilog_top
 .PHONY: all clean debug
 
 all: $(TARGET) $(TARGET_TOP)
-
-debug: OCAML_FLAGS += -g
-debug: $(TARGET)
 
 json_verilog.ml json_verilog.mli: json_verilog.mly json_types.cmi
 	$(MENHIR) --explain --dump --infer $<

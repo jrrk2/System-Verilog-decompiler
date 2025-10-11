@@ -30,13 +30,22 @@ let rec parse_type attr json =
       VoidType { name; resolved = None }
       
   | "UNPACKARRAYDTYPE" ->
-      let base_ref = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
+      let base = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
       let range_json = json |> member "rangep" |> to_list in
       let range = match range_json with
         | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
         | _ -> ""
       in
-      ArrayType' { base = base_ref; range }
+      ArrayType' { base; range }
+
+  | "PACKARRAYDTYPE" ->
+      let base = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
+      let range_json = json |> member "rangep" |> to_list in
+      let range = match range_json with
+        | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
+        | _ -> ""
+      in
+      PackArrayType' { base; range }
 
   | "IFACEREFDTYPE" ->
       let ifacename = json |> member "ifaceName" |> to_string_option |> Option.value ~default:"" in
@@ -54,11 +63,24 @@ let rec parse_type attr json =
       let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
       StructType { name; packed; members }
 
+  | "UNIONDTYPE" ->
+      let name = json |> member "name" |> to_string in
+      let packed = json |> member "packed" |> to_bool in
+      let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
+      UnionType { name; packed; members }
+
   | "MEMBERDTYPE" ->
       let name = json |> member "name" |> to_string in
+      let dtype = json |> member "dtypep" |> to_string in
       let child = json |> member "childDTypep" |> to_list |> List.map (parse_type attr) in
       let value = json |> member "valuep" |> to_list |> List.map (parse_type attr) in
-      MemberType { name; child; value }
+      MemberType' { name; dtype; child; value }
+
+  | "CONSTDTYPE" ->
+      let name = json |> member "name" |> to_string in
+      let dtype = json |> member "dtypep" |> to_string in
+      let child = json |> member "childDTypep" |> to_list |> List.map (parse_type attr) in
+      ConstType' { name; dtype; child }
 
   | oth -> UnknownType (node_type, json )
 
@@ -131,7 +153,7 @@ let rec parse_json attr json =
       Cell' { name; modp_addr; pins }
       
   | "PIN" ->
-      let expr = json |> member "exprp" |> to_list |> List.hd |> parse' attr name in
+      let expr = try Some (json |> member "exprp" |> to_list |> List.hd |> parse' attr name) with _ -> None in
       Pin { name; expr }
       
   | "MODPORT" ->
@@ -173,6 +195,10 @@ let rec parse_json attr json =
       if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr];
       v            
 									    
+  | "INITITEM" ->
+      let value = json |> member "valuep" |> to_list |> List.map (parse' attr name) in
+      InitItem { value }
+									    
   | "CONST" ->
       let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       Const' { name; dtype_ref }
@@ -208,6 +234,11 @@ let rec parse_json attr json =
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
       Assign { lhs; rhs; is_blocking = true }
+      
+  | "INSIDERANGE" ->
+      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      InsideRange { lhs; rhs }
       
   | "ASSIGNDLY" ->
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
@@ -285,6 +316,11 @@ let rec parse_json attr json =
           with _ -> None
         ) in
       TaskRef { name; args }
+
+  | "RAND" ->
+      let name = json |> member "name" |> to_string in
+      let args = json |> member "seedp" |> to_list |> List.map (parse' attr name) in
+      FuncRef { name; args }
       
   | "COND" ->
       let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
@@ -308,20 +344,27 @@ let rec parse_json attr json =
       SenItem { edge_str; signal }
       
   (* Binary operators *)
-  | "AND" | "OR" | "XOR" | "EQ" | "NEQ" | "LT" | "GT" | "LTS" | "GTS" 
-  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "SHIFTL" | "SHIFTR" ->
+  | "AND" | "OR" | "XOR"
+  | "EQ" | "NEQ" | "LT" | "LTE" | "LTES" | "GT" | "GTE" | "GTES" | "LTS" | "GTS"
+  | "EQWILD" | "NEQWILD" | "NEQCASE"
+  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "POWSU" | "SHIFTL" | "SHIFTR" | "SHIFTRS" ->
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
       BinaryOp { op = node_type; lhs; rhs }
       
   (* Unary operators *)
-  | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" ->
+  | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" | "LOGNOT" | "ONEHOT" | "ONEHOT0" | "NEGATE"
+  | "EXTENDS" | "ISUNKNOWN" | "CLOG2" ->
       let operand = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       UnaryOp { op = node_type; operand }
   | "EVENTCONTROL" ->
       let sense = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       EventCtrl {sense; stmts}
+  | "INITARRAY" ->
+      let inits = json |> member "initsp" |> to_list |> List.map (parse' attr name) in
+      InitArray {inits}
+
   | "INITIAL" ->
       let suspend = json |> member "isSuspendable" |> to_bool in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
@@ -333,16 +376,47 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       InitialStatic {suspend; process; stmts}
 
+  | "FINAL" ->
+      let suspend = json |> member "isSuspendable" |> to_bool in
+      let process = json |> member "needProcess" |> to_bool in
+      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      Final {suspend; process; stmts}
+
   | "DELAY" ->
       let cycle = json |> member "isCycleDelay" |> to_bool in
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       Delay {cycle; lhs; stmts}
 
+  | "ITORD" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let lhs = json |> member "lhsp" |> to_list |> List.map (parse' attr name) in
+      Itord' {dtype; lhs}
+
+  | "CVTPACKSTRING" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let lhs = json |> member "lhsp" |> to_list |> List.map (parse' attr name) in
+      CvtPackString' {dtype; lhs}
+
+  | "FOPEN" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let filename = json |> member "filenamep" |> to_list |> List.map (parse' attr name) in
+      let mode = json |> member "modep" |> to_list |> List.map (parse' attr name) in
+      Fopen' {dtype; filename; mode}
+
+  | "FCLOSE" ->
+      let file = json |> member "filep" |> to_list |> List.map (parse' attr name) in
+      Fclose {file}
+
   | "DISPLAY" ->
       let fmt = json |> member "fmtp" |> to_list |> List.map (parse' attr name) in
       let file = json |> member "filep" |> to_list |> List.map (parse' attr name) in
       Display {fmt; file}
+
+  | "SFORMAT" ->
+      let fmt = json |> member "fmtp" |> to_list |> List.map (parse' attr name) in
+      let lhs = json |> member "lhsp" |> to_list |> List.map (parse' attr name) in
+      Sformat {fmt; lhs}
 
   | "SFORMATF" ->
       let expr = json |> member "exprsp" |> to_list |> List.map (parse' attr name) in
@@ -385,6 +459,41 @@ let rec parse_json attr json =
       let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
      ConsPackMember' {dtype; rhs}
 
+  | "VALUEPLUSARGS" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let search = json |> member "searchp" |> to_list |> List.map (parse' attr name) in
+      let out = json |> member "outp" |> to_list |> List.map (parse' attr name) in
+     ValuePlusArgs' {dtype; search; out}
+
+  | "TESTPLUSARGS" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let search = json |> member "searchp" |> to_list |> List.map (parse' attr name) in
+     TestPlusArgs' {dtype; search}
+
+  | "REPLICATE" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let src = json |> member "srcp" |> to_list |> List.hd |> parse' attr name in
+      let count = json |> member "countp" |> to_list |> List.hd |> parse' attr name in
+     Replicate' {dtype; src; count}
+
+  | "JUMPBLOCK" ->
+      let stmt = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+     JumpBlock { stmt }
+
+  | "JUMPGO" ->
+      let label = json |> member "labelp" |> to_string in
+      JumpGo' { label }
+
+  | "STOP" ->
+      let fatal = json |> member "isFatal" |> to_bool in
+      Stop { fatal }
+
+  | "CMETHODHARD" ->
+      let dtype = json |> member "dtypep" |> to_string in
+      let from = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
+      let pins = json |> member "pinsp" |> to_list |> List.map (parse' attr name) in
+      CMethodHard' { dtype; from; pins }
+ 
   | oth -> Unknown (node_type, json)
 
   and parse' attr name = parse_json ({attr with parent=name::attr.parent})
@@ -400,7 +509,8 @@ let rec rw attr = function
   Var {name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param}
 | Cell' {name; modp_addr; pins } ->
   Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=List.map (rw attr) pins}
-| Pin {name; expr} -> Pin {name; expr=rw attr expr}
+| Pin {name; expr} -> Pin {name; expr=rwopt attr expr}
+| InsideRange {lhs; rhs} -> InsideRange {lhs=rw attr lhs; rhs=rw attr rhs}
 | Assign {lhs; rhs; is_blocking} -> Assign {lhs=rw attr lhs; rhs=rw attr rhs; is_blocking}
 | AssignW {lhs; rhs} -> AssignW {lhs=rw attr lhs; rhs=rw attr rhs}
 | VarRef {name; access} as v -> v
@@ -419,8 +529,10 @@ let rec rw attr = function
 | Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
 | Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
 | EventCtrl { sense; stmts} -> EventCtrl {sense = List.map (rw attr) sense; stmts = List.map (rw attr) stmts}
+| InitArray { inits} -> InitArray {inits = List.map (rw attr) inits}
 | Initial { suspend; stmts} -> Initial {suspend; stmts = List.map (rw attr) stmts}
 | InitialStatic { suspend; process; stmts} -> InitialStatic {suspend; process; stmts = List.map (rw attr) stmts}
+| Final { suspend; process; stmts} -> Final {suspend; process; stmts = List.map (rw attr) stmts}
 | Delay { cycle; lhs; stmts} -> Delay {cycle; lhs = rw attr lhs; stmts = List.map (rw attr) stmts}
 | While { condition; stmts; incs} -> While {condition = rw attr condition;
 stmts = List.map (rw attr) stmts;
@@ -437,6 +549,7 @@ incs = List.map (rw attr) incs;}
 | TaskRef { name; args } -> TaskRef { name; args = List.map (rw attr) args }
 | Concat { parts } -> Concat { parts = List.map (rw attr) parts }
 | Display { fmt; file } -> Display { fmt=List.map (rw attr) fmt; file = List.map (rw attr) file }
+| Sformat { fmt; lhs } -> Sformat { fmt=List.map (rw attr) fmt; lhs = List.map (rw attr) lhs }
 | Sformatp { expr; scope } -> Sformatp { expr=List.map (rw attr) expr; scope = List.map (rw attr) scope }
 | ScopeName { dtype } -> ScopeName { dtype }
 | Time { dtype } -> Time { dtype }
@@ -448,6 +561,32 @@ incs = List.map (rw attr) incs;}
 | Typedef' { name; dtype_ref } -> Typedef { name;
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
 | Typedef { name; dtype_ref } -> Typedef { name; dtype_ref } 
+| Itord' { dtype; lhs } -> Itord {
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    lhs = List.map (rw attr) lhs }
+| Itord { dtype_ref; lhs } -> Itord { dtype_ref; lhs } 
+| CvtPackString' { dtype; lhs } -> CvtPackString {
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    lhs = List.map (rw attr) lhs }
+| CvtPackString { dtype_ref; lhs } -> CvtPackString { dtype_ref; lhs } 
+| Fopen' { dtype; filename; mode } -> Fopen {
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    filename = List.map (rw attr) filename;
+    mode = List.map (rw attr) mode }
+| Fopen { dtype_ref; filename; mode } -> Fopen { dtype_ref; filename; mode } 
+| Fclose { file } -> Fclose {
+    file = List.map (rw attr) file }
+| ValuePlusArgs' { dtype; search; out } -> ValuePlusArgs {
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    search = List.map (rw attr) search;
+    out = List.map (rw attr) out;
+ }
+| ValuePlusArgs _ as v -> v
+| TestPlusArgs' { dtype; search } -> TestPlusArgs {
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    search = List.map (rw attr) search;
+ }
+| TestPlusArgs _ as v -> v
 | Func' { name; dtype_ref; stmts; vars } -> Func {
       name;
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
@@ -462,6 +601,15 @@ incs = List.map (rw attr) incs;}
       dtype_ref = rwtyp' attr dtype_ref;
       stmts = List.map (rw attr) stmts;
       vars = List.map (rw attr) vars }
+| JumpBlock { stmt } -> JumpBlock {
+      stmt = List.map (rw attr) stmt }
+| JumpGo' { label } -> JumpGo {
+      label=rwtyp' attr (Hashtbl.find_opt attr.type_table label) }
+| JumpGo { label } -> JumpGo { label }
+| Replicate' { dtype; src; count } -> Replicate {
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+      src = rw attr src ;
+      count = rw attr count }
 | Task' { name; dtype_ref; stmts; vars } -> Task {
       name;
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
@@ -487,8 +635,17 @@ incs = List.map (rw attr) incs;}
 | CaseItem { conditions; stmts } -> CaseItem {
       conditions = List.map (rw attr) conditions;
       stmts = List.map (rw attr) stmts }
+| InitItem { value } -> InitItem {
+      value = List.map (rw attr) value }
+| CMethodHard' { dtype; from; pins } -> CMethodHard {
+      dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+      from=rw attr from;
+      pins = List.map (rw attr) pins }
 | Const _
 | Cell _
+| Stop _
+| Replicate _
+| CMethodHard _
 | Var _ as skip -> skip
 | Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"
 
@@ -509,6 +666,9 @@ and rwtyp attr = function
 | ArrayType' { base=base_ref; range } ->
   let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
   ArrayType { base = base_type; range }
+| PackArrayType' { base=base_ref; range } ->
+  let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
+  PackArrayType { base = base_type; range }
 | IntfRefType' { ifacename; modportname; ifacep; modportp } ->
   IntfRefType { ifacename;
   modportname;
@@ -518,7 +678,20 @@ and rwtyp attr = function
 | RefType {name; resolved} as t -> t
 | EnumType {name; items} as t -> t
 | StructType { name; packed; members } -> StructType { name; packed; members = List.map (rwtyp attr) members }
-| MemberType { name; child; value } -> MemberType { name; child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
+| UnionType { name; packed; members } -> UnionType { name; packed; members = List.map (rwtyp attr) members }
+| MemberType' { name; dtype; child; value } ->
+    MemberType { name;
+    dtype_ref = (try Some (rwtyp attr (Hashtbl.find attr.type_table dtype)) with Not_found -> None);
+    child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
+| MemberType { name; dtype_ref; child; value } ->
+    MemberType { name; dtype_ref; child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
+| ConstType' { name; dtype; child } ->
+    ConstType { name;
+    dtype_ref = None (* (try Some (rwtyp attr (Hashtbl.find attr.type_table dtype)) with Not_found -> None) *);
+    child = List.map (rwtyp attr) child }
+| ConstType { name; dtype_ref; child } ->
+    ConstType { name; dtype_ref; child = List.map (rwtyp attr) child }
+| VoidType { name; resolved } -> VoidType { name; resolved }
 | oth -> othrwtyp := Some oth; failwith "othrwtyp"
 
 let dbgpass1 = ref (Unknown ("",`Null))

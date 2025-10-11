@@ -5,3 +5,7 @@ open Yojson;;
 open Sv_ast;;
 open Sv_parse;;
 open Sv_main;;
+
+let _ = scan();;
+let ast = Hashtbl.find asthash "Vcomprehensive_sv_testcase.tree.json";;
+let ast' = Hashtbl.find asthash "Variane_testharness.tree.json";;

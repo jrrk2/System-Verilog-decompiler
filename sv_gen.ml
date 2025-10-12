@@ -224,7 +224,6 @@ let rec extract_struct_members = function
   | Some (StructType { members; _ }) ->
       List.filter_map (function
         | MemberType { name; dtype_ref; _ } ->
-            (* Use dtype_ref instead of child *)
             let typ = match dtype_ref with
               | Some (BasicType { keyword; range = Some r; _ }) -> 
                   Printf.sprintf "%s [%s]" keyword r
@@ -368,19 +367,18 @@ let rec generate_sv node indent =
         | _ -> false
       ) stmts in
 
-      if name <> "" && not (String.contains name '$') && 
-         not (String.contains name '[') &&
-         name <> "unnamedblk1" then
-        if is_generate then
-          if has_indexed_children && List.length stmts > 0 then
-            Printf.sprintf "%sgenerate\n%s  for (genvar i = 0; i < 2; i++) begin : %s\n%s\n%s  end\n%sendgenerate" 
-              ind ind name stmt_str ind ind
-          else
-            Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
+      (* Don't generate parent blocks for indexed generate blocks *)
+      if String.contains name '[' then
+        (* This is an indexed instance like gen_byte_enables[0] *)
+        Printf.sprintf "%s// Generate block instance %s\n%s" ind name stmt_str
+      else if name <> "" && not (String.contains name '$') && name <> "unnamedblk1" then
+        if is_generate && has_indexed_children then
+          (* Parent block with indexed children - don't output empty parent *)
+          stmt_str
+        else if is_generate then
+          Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
         else
           Printf.sprintf "%sbegin : %s\n%s\n%send" ind name stmt_str ind
-      else if String.contains name '[' then
-        Printf.sprintf "%s// Generate block instance %s\n%s" ind name stmt_str
       else
         Printf.sprintf "%sbegin\n%s\n%send" ind stmt_str ind
 
@@ -533,15 +531,14 @@ let rec generate_sv node indent =
 
       let params_str = 
         if List.length inputs > 0 then
-          "\n" ^
-          (String.concat "\n" (List.map (fun v ->
+          let params = List.map (fun v ->
             match v with
             | Var { name = vname; dtype_ref = vtype; dtype_name; _ } ->
                 let vtype_str = resolve_type_with_brackets dtype_name vtype in
-                Printf.sprintf "        input %s %s;" vtype_str vname
+                Printf.sprintf "input %s %s" vtype_str vname
             | _ -> ""
-          ) inputs)) ^
-          "\n"
+          ) inputs in
+          String.concat ", " params
         else
           ""
       in
@@ -549,7 +546,7 @@ let rec generate_sv node indent =
       let body_str = String.concat "\n" 
         (List.map (generate_sv_with_interfaces_indent (indent + 2) []) stmts) in
 
-      Printf.sprintf "%sfunction automatic %s %s();%s%s\n%sendfunction" 
+      Printf.sprintf "%sfunction automatic %s %s(%s);\n%s\n%sendfunction" 
         ind return_type name params_str body_str ind
 
   | Task { name; dtype_ref; stmts; vars; _ } ->
@@ -560,16 +557,15 @@ let rec generate_sv node indent =
 
       let params_str = 
         if List.length inputs > 0 then
-          "\n" ^
-          (String.concat "\n" (List.map (fun v ->
+          let params = List.map (fun v ->
             match v with
             | Var { name = vname; dtype_ref = vtype; dtype_name; direction; _ } ->
                 let vtype_str = resolve_type_with_brackets dtype_name vtype in
                 let dir_str = String.lowercase_ascii direction in
-                Printf.sprintf "        %s %s %s;" dir_str vtype_str vname
+                Printf.sprintf "%s %s %s" dir_str vtype_str vname
             | _ -> ""
-          ) inputs)) ^
-          "\n"
+          ) inputs in
+          String.concat ", " params
         else
           ""
       in
@@ -577,9 +573,10 @@ let rec generate_sv node indent =
       let body_str = String.concat "\n"
         (List.map (generate_sv_with_interfaces_indent (indent + 2) []) stmts) in
 
-      Printf.sprintf "%stask automatic %s();%s%s\n%sendtask"
+      Printf.sprintf "%stask automatic %s(%s);\n%s\n%sendtask"
       ind name params_str body_str ind
-| Display { fmt; file; _ } ->
+
+  | Display { fmt; file; _ } ->
       ""
 
   | Sformatp { expr; scope; _ } ->
@@ -742,13 +739,14 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
     | _ -> acc
   ) [] stmts in
   
-  (* Separate statements, keeping generate blocks together *)
-  let (regular_ports, cells, gen_blocks, other_stmts) = 
-    List.fold_left (fun (ports, cells, gens, others) stmt ->
+  (* Separate module parameters and regular statements *)
+  let (params, regular_ports, cells, gen_blocks, other_stmts) = 
+    List.fold_left (fun (ps, ports, cells, gens, others) stmt ->
       match stmt with
-      | Var { var_type = "PORT"; _ } as v -> (v :: ports, cells, gens, others)
-      | Var { var_type = "IFACEREF"; _ } -> (ports, cells, gens, others)
-      | Cell _ as c -> (ports, c :: cells, gens, others)
+      | Var { var_type = "GPARAM"; _ } as v -> (v :: ps, ports, cells, gens, others)
+      | Var { var_type = "PORT"; _ } as v -> (ps, v :: ports, cells, gens, others)
+      | Var { var_type = "IFACEREF"; _ } -> (ps, ports, cells, gens, others)
+      | Cell _ as c -> (ps, ports, c :: cells, gens, others)
       | Always { always; senses; stmts = astmts; _ } as a ->
           (* Filter out assertion always blocks *)
           let has_display = List.exists (function
@@ -756,13 +754,31 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
             | If { condition = Cexpr _; _ } -> true
             | _ -> false
           ) astmts in
-          if has_display then (ports, cells, gens, others)
-          else (ports, cells, gens, a :: others)
+          if has_display then (ps, ports, cells, gens, others)
+          else (ps, ports, cells, gens, a :: others)
       | Begin { name = bname; is_generate = true; _ } as b ->
           (* Keep all generate blocks together *)
-          (ports, cells, b :: gens, others)
-      | _ -> (ports, cells, gens, stmt :: others)
-    ) ([], [], [], []) stmts in
+          (ps, ports, cells, b :: gens, others)
+      | _ -> (ps, ports, cells, gens, stmt :: others)
+    ) ([], [], [], [], []) stmts in
+
+  (* Generate module header with parameters *)
+  let param_str = if List.length params > 0 then
+    let param_decls = List.map (fun p -> 
+      match p with
+      | Var { name; dtype_ref; dtype_name; value; _ } ->
+          let resolved_type = resolve_type_with_brackets dtype_name dtype_ref in
+          let val_str = match value with
+            | Some v -> " = " ^ (generate_sv_with_interfaces v 0 [] |> String.trim)
+            | None -> ""
+          in
+          Printf.sprintf "  parameter %s %s%s" resolved_type name val_str
+      | _ -> ""
+    ) (List.rev params) in
+    " #(\n" ^ String.concat ",\n" param_decls ^ "\n)"
+  else
+    ""
+  in
 
   let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) regular_ports in
   
@@ -818,7 +834,7 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
   let body_parts = signal_decls @ cell_stmts @ gen_stmts @ other_assigns in
   let body = String.concat "\n" (List.filter (fun s -> s <> "") body_parts) in
 
-  Printf.sprintf "module %s (\n%s\n);\n%s\nendmodule" name port_str body
+  Printf.sprintf "module %s%s (\n%s\n);\n%s\nendmodule" name param_str port_str body
 
 and generate_interface_module_with_interfaces name stmts interface_refs interfaces =
   match interface_refs with

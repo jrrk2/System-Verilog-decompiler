@@ -6,6 +6,7 @@ open Sv_ast;;
 open Sv_parse;;
 open Sv_main;;
 
-let _ = scan();;
+let _ = scan "results/";;
 let ast = Hashtbl.find asthash "Vcomprehensive_sv_testcase.tree.json";;
 let ast' = Hashtbl.find asthash "Variane_testharness.tree.json";;
+let ast'' = Hashtbl.find asthash "Vdebug_test.tree.json";;

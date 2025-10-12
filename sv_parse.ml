@@ -106,6 +106,7 @@ let rec parse_type_table attr json =
   ) types_json
 
 let netlist = ref []
+let depth = ref []
 
 (* Parse JSON to AST with type table support *)
 let rec parse_json attr json =
@@ -382,6 +383,9 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       Final {suspend; process; stmts}
 
+  | "FINISH" ->
+      Finish
+
   | "DELAY" ->
       let cycle = json |> member "isCycleDelay" |> to_bool in
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
@@ -496,7 +500,11 @@ let rec parse_json attr json =
  
   | oth -> Unknown (node_type, json)
 
-  and parse' attr name = parse_json ({attr with parent=name::attr.parent})
+  and parse' attr name json =
+     depth := json :: !depth;
+     let rslt = parse_json ({attr with parent=name::attr.parent}) json in
+     depth := List.tl !depth;
+     rslt
 
 let othrw = ref None
 let othrwtyp = ref None
@@ -533,6 +541,7 @@ let rec rw attr = function
 | Initial { suspend; stmts} -> Initial {suspend; stmts = List.map (rw attr) stmts}
 | InitialStatic { suspend; process; stmts} -> InitialStatic {suspend; process; stmts = List.map (rw attr) stmts}
 | Final { suspend; process; stmts} -> Final {suspend; process; stmts = List.map (rw attr) stmts}
+| Finish -> Finish
 | Delay { cycle; lhs; stmts} -> Delay {cycle; lhs = rw attr lhs; stmts = List.map (rw attr) stmts}
 | While { condition; stmts; incs} -> While {condition = rw attr condition;
 stmts = List.map (rw attr) stmts;
@@ -710,6 +719,7 @@ let parse json =
   module_table = Hashtbl.create 20;
   var_table = Hashtbl.create 20;
   } in
+  depth := json :: [];
   let ast' = parse_json attr json in
   dbgpass1 := ast';
   let ast = rw attr (rw attr ast') in

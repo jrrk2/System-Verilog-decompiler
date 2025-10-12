@@ -249,6 +249,7 @@ and sv_node =
       process: bool;
       stmts: sv_node list;
     }
+  | Finish
   | Final of {
       suspend: bool;
       process: bool;

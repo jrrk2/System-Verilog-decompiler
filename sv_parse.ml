@@ -31,19 +31,45 @@ let rec parse_type attr json =
       
   | "UNPACKARRAYDTYPE" ->
       let base = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
-      let range_json = json |> member "rangep" |> to_list in
-      let range = match range_json with
-        | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
-        | _ -> ""
+      (* FIXED: Use declRange if available, otherwise parse rangep *)
+      let range = match json |> member "declRange" |> to_string_option with
+        | Some decl_range when decl_range <> "" -> 
+            (* Remove brackets from "[0:3]" to get "0:3" *)
+            if String.length decl_range > 2 then
+              String.sub decl_range 1 (String.length decl_range - 2)
+            else
+              ""
+        | _ ->
+            (* Fall back to parsing rangep array *)
+            let range_json = json |> member "rangep" |> to_list in
+            (match range_json with
+            | r :: _ -> 
+                let left = r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                let right = r |> member "rightp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                Printf.sprintf "%s:%s" left right
+            | _ -> "")
       in
       ArrayType' { base; range }
 
   | "PACKARRAYDTYPE" ->
       let base = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
-      let range_json = json |> member "rangep" |> to_list in
-      let range = match range_json with
-        | r :: _ -> r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:""
-        | _ -> ""
+      (* FIXED: Use declRange if available, otherwise parse rangep *)
+      let range = match json |> member "declRange" |> to_string_option with
+        | Some decl_range when decl_range <> "" -> 
+            (* Remove brackets from "[0:3]" to get "0:3" *)
+            if String.length decl_range > 2 then
+              String.sub decl_range 1 (String.length decl_range - 2)
+            else
+              ""
+        | _ ->
+            (* Fall back to parsing rangep array *)
+            let range_json = json |> member "rangep" |> to_list in
+            (match range_json with
+            | r :: _ -> 
+                let left = r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                let right = r |> member "rightp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                Printf.sprintf "%s:%s" left right
+            | _ -> "")
       in
       PackArrayType' { base; range }
 

@@ -240,6 +240,9 @@ let rec extract_struct_members = function
 (* Improved constant parser - FIXED *)
 let parse_verilog_const s =
   try
+    (* Remove any whitespace *)
+    let s = String.trim s in
+    
     (* Handle simple decimal numbers first *)
     if not (String.contains s '\'') then
       int_of_string s
@@ -247,29 +250,48 @@ let parse_verilog_const s =
       let parts = Str.split (Str.regexp "'") s in
       match parts with
       | [width; value_part] ->
-          let value_str = if String.length value_part > 0 then
-            String.sub value_part 1 (String.length value_part - 1)
-          else "0" in
-          
-          (match String.get value_part 0 with
-          | 'h' -> int_of_string ("0x" ^ value_str)
-          | 'd' -> int_of_string value_str
-          | 's' ->
-              (* Handle signed constants like 32'sh3 *)
-              if String.length value_part > 1 then
-                (match String.get value_part 1 with
-                | 'h' -> int_of_string ("0x" ^ String.sub value_part 2 (String.length value_part - 2))
-                | 'd' -> int_of_string (String.sub value_part 2 (String.length value_part - 2))
-                | _ -> int_of_string value_str)
-              else 0
-          | 'b' ->
-              (* Binary constant *)
-              int_of_string ("0b" ^ value_str)
-          | _ -> 0)
+          if String.length value_part = 0 then 0
+          else
+            let first_char = String.get value_part 0 in
+            (match first_char with
+            | 'h' -> 
+                let hex_str = String.sub value_part 1 (String.length value_part - 1) in
+                int_of_string ("0x" ^ hex_str)
+            | 'd' -> 
+                let dec_str = String.sub value_part 1 (String.length value_part - 1) in
+                int_of_string dec_str
+            | 's' ->
+                (* Handle signed constants like 32'sh3 or 32'sh0 *)
+                if String.length value_part > 1 then
+                  let second_char = String.get value_part 1 in
+                  (match second_char with
+                  | 'h' -> 
+                      let hex_str = String.sub value_part 2 (String.length value_part - 2) in
+                      int_of_string ("0x" ^ hex_str)
+                  | 'd' -> 
+                      let dec_str = String.sub value_part 2 (String.length value_part - 2) in
+                      int_of_string dec_str
+                  | _ -> 
+                      (* Might be just 's' followed by a number *)
+                      let num_str = String.sub value_part 1 (String.length value_part - 1) in
+                      int_of_string num_str)
+                else 0
+            | 'b' ->
+                (* Binary constant *)
+                let bin_str = String.sub value_part 1 (String.length value_part - 1) in
+                int_of_string ("0b" ^ bin_str)
+            | c when c >= '0' && c <= '9' ->
+                (* Sometimes format is like 32'0 without type specifier *)
+                int_of_string value_part
+            | _ -> 
+                if !debug then Printf.eprintf "Warning: Unknown format '%c' in '%s'\n" first_char s;
+                0)
       | [num] -> int_of_string num
-      | _ -> 0
+      | _ -> 
+          if !debug then Printf.eprintf "Warning: Unexpected format in '%s'\n" s;
+          0
   with e ->
-    if !debug then Printf.eprintf "Warning: Could not parse constant '%s': %s\n" s (Printexc.to_string e);
+    Printf.eprintf "Error: Could not parse constant '%s': %s\n" s (Printexc.to_string e);
     0
 
 let rec generate_sv node indent =
@@ -310,12 +332,14 @@ let rec generate_sv node indent =
       (* Extract array range if present - FIXED *)
       let array_range = match dtype_ref with
         | Some (ArrayType { range; _ }) -> 
+            (* The range field now contains the correct range from declRange *)
             if String.contains range ':' then
+              (* Already a proper range like "0:3" *)
               " [" ^ range ^ "]"
             else
-              (* Parse the constant properly *)
-              let size = parse_verilog_const range in
-              Printf.sprintf " [0:%d]" size
+              (* Shouldn't happen with fixed parser, but handle just in case *)
+              let upper_bound = parse_verilog_const range in
+              Printf.sprintf " [0:%d]" upper_bound
         | _ -> ""
       in
       
@@ -447,16 +471,36 @@ let rec generate_sv node indent =
       let base = generate_sv_with_interfaces expr 0 [] |> String.trim in
       (match lsb, width with
       | Some l, Some w ->
-          Printf.sprintf "%s[%s +: %s]" base
-            (generate_sv_with_interfaces l 0 [] |> String.trim)
-            (generate_sv_with_interfaces w 0 [] |> String.trim)
-      | Some l, None ->
+          (* Part select with +: operator *)
           let lsb_str = generate_sv_with_interfaces l 0 [] |> String.trim in
-          (* Check if lsb is a Sel itself (for nested indexing) *)
+          let width_str = generate_sv_with_interfaces w 0 [] |> String.trim in
+          Printf.sprintf "%s[%s +: %s]" base lsb_str width_str
+      | Some l, None ->
+          (* Single bit or range select *)
+          (* Check if this is a meaningless [0] selection *)
           (match l with
-          | Sel _ -> Printf.sprintf "%s[%s]" base lsb_str
-          | _ -> Printf.sprintf "%s[%s]" base lsb_str)
-      | None, None when range <> "" -> Printf.sprintf "%s[%s]" base range
+          | Const { name = cname; _ } -> 
+              let const_val = parse_verilog_const cname in
+              if const_val = 0 && width = None then
+                (* Selecting bit [0] or starting at 0 with no width - often meaningless *)
+                (* Check if this is part of an array index (parent is ArraySel) *)
+                (* For now, just skip [0] selections that don't add meaning *)
+                base
+              else
+                let lsb_str = generate_sv_with_interfaces l 0 [] |> String.trim in
+                Printf.sprintf "%s[%s]" base lsb_str
+          | Sel _ -> 
+              (* Nested selection *)
+              let lsb_str = generate_sv_with_interfaces l 0 [] |> String.trim in
+              Printf.sprintf "%s[%s]" base lsb_str
+          | _ -> 
+              let lsb_str = generate_sv_with_interfaces l 0 [] |> String.trim in
+              Printf.sprintf "%s[%s]" base lsb_str)
+      | None, None when range <> "" && range <> "[7:0]" && range <> "[3:0]" && range <> "[15:0]" && range <> "[31:0]" -> 
+          Printf.sprintf "%s%s" base range
+      | None, None when range <> "" ->
+          (* Common ranges that are redundant *)
+          base
       | _ -> base)
 
   | ArraySel { expr; index; _ } ->

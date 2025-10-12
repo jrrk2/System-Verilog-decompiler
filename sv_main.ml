@@ -12,9 +12,8 @@ let translate_tree_to_ast json_file =
 
 let asthash = Hashtbl.create 255
 
-let scan () =
+let scan rslt =
       let obj = "obj_dir/" in
-      let rslt = "results/" in
       (try Unix.mkdir rslt 0o750 with e -> Printf.eprintf "%s: %s\n" rslt (Printexc.to_string e));
       let lst = ref [] in
       let fd = Unix.opendir obj in

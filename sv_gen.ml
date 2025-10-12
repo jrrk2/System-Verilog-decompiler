@@ -205,7 +205,7 @@ let binary_op_to_string = function
 
 (* Unary operator conversion *)
 let unary_op_to_string = function
-  | "NOT" -> "!"
+  | "NOT" -> "~"
   | "LOGNOT" -> "!"
   | "REDAND" -> "&"
   | "REDOR" -> "|"
@@ -237,6 +237,41 @@ let rec extract_struct_members = function
       ) members
   | _ -> []
 
+(* Improved constant parser - FIXED *)
+let parse_verilog_const s =
+  try
+    (* Handle simple decimal numbers first *)
+    if not (String.contains s '\'') then
+      int_of_string s
+    else
+      let parts = Str.split (Str.regexp "'") s in
+      match parts with
+      | [width; value_part] ->
+          let value_str = if String.length value_part > 0 then
+            String.sub value_part 1 (String.length value_part - 1)
+          else "0" in
+          
+          (match String.get value_part 0 with
+          | 'h' -> int_of_string ("0x" ^ value_str)
+          | 'd' -> int_of_string value_str
+          | 's' ->
+              (* Handle signed constants like 32'sh3 *)
+              if String.length value_part > 1 then
+                (match String.get value_part 1 with
+                | 'h' -> int_of_string ("0x" ^ String.sub value_part 2 (String.length value_part - 2))
+                | 'd' -> int_of_string (String.sub value_part 2 (String.length value_part - 2))
+                | _ -> int_of_string value_str)
+              else 0
+          | 'b' ->
+              (* Binary constant *)
+              int_of_string ("0b" ^ value_str)
+          | _ -> 0)
+      | [num] -> int_of_string num
+      | _ -> 0
+  with e ->
+    if !debug then Printf.eprintf "Warning: Could not parse constant '%s': %s\n" s (Printexc.to_string e);
+    0
+
 let rec generate_sv node indent =
   let ind = String.make (indent * 2) ' ' in
   match node with
@@ -260,37 +295,26 @@ let rec generate_sv node indent =
           ""
       | Some (Module { name = module_name; _ } as mod_def) ->
           let connections = generate_cell_connections pins (Some mod_def) [] in
-          Printf.sprintf "%s%s %s (%s);" ind module_name name (String.concat ", " connections)
+          if List.length connections > 0 then
+            Printf.sprintf "%s%s %s (\n%s%s\n%s);" ind module_name name 
+              (String.make ((indent + 1) * 2) ' ')
+              (String.concat (",\n" ^ String.make ((indent + 1) * 2) ' ') connections)
+              ind
+          else
+            Printf.sprintf "%s%s %s ();" ind module_name name
       | _ -> Printf.sprintf "%s// Unknown cell %s" ind name)
 
   | Var { name; dtype_ref; var_type; direction; value; dtype_name; is_param; _ } ->
       let resolved_type = resolve_type_with_brackets dtype_name dtype_ref in
 
-      (* Extract array range if present *)
+      (* Extract array range if present - FIXED *)
       let array_range = match dtype_ref with
         | Some (ArrayType { range; _ }) -> 
             if String.contains range ':' then
               " [" ^ range ^ "]"
             else
-              let parse_verilog_const s =
-                try
-                  let parts = Str.split (Str.regexp "'") s in
-                  match parts with
-                  | [_; rest] ->
-                      let value_str = if String.length rest > 0 then
-                        String.sub rest 1 (String.length rest - 1)
-                      else "0" in
-                      if String.get rest 0 = 'h' then
-                        int_of_string ("0x" ^ value_str)
-                      else if String.get rest 0 = 'd' then
-                        int_of_string value_str
-                      else
-                        int_of_string value_str
-                  | _ -> 0
-                with _ -> 255
-              in
-              let upper = parse_verilog_const range in
-              let size = if upper = 0 then 255 else upper in
+              (* Parse the constant properly *)
+              let size = parse_verilog_const range in
               Printf.sprintf " [0:%d]" size
         | _ -> ""
       in
@@ -370,8 +394,8 @@ let rec generate_sv node indent =
       (* Don't generate parent blocks for indexed generate blocks *)
       if String.contains name '[' then
         (* This is an indexed instance like gen_byte_enables[0] *)
-        Printf.sprintf "%s// Generate block instance %s\n%s" ind name stmt_str
-      else if name <> "" && not (String.contains name '$') && name <> "unnamedblk1" then
+        Printf.sprintf "%s// Generate instance %s\n%s" ind name stmt_str
+      else if name <> "" && not (String.contains name '$') && name <> "unnamedblk1" && not (Str.string_match (Str.regexp ".*unnamedblk.*") name 0) then
         if is_generate && has_indexed_children then
           (* Parent block with indexed children - don't output empty parent *)
           stmt_str
@@ -427,7 +451,11 @@ let rec generate_sv node indent =
             (generate_sv_with_interfaces l 0 [] |> String.trim)
             (generate_sv_with_interfaces w 0 [] |> String.trim)
       | Some l, None ->
-          Printf.sprintf "%s[%s]" base (generate_sv_with_interfaces l 0 [] |> String.trim)
+          let lsb_str = generate_sv_with_interfaces l 0 [] |> String.trim in
+          (* Check if lsb is a Sel itself (for nested indexing) *)
+          (match l with
+          | Sel _ -> Printf.sprintf "%s[%s]" base lsb_str
+          | _ -> Printf.sprintf "%s[%s]" base lsb_str)
       | None, None when range <> "" -> Printf.sprintf "%s[%s]" base range
       | _ -> base)
 
@@ -577,7 +605,24 @@ let rec generate_sv node indent =
       ind name params_str body_str ind
 
   | Display { fmt; file; _ } ->
-      ""
+      (* Extract time and scope formatting if present *)
+      let fmt_parts = List.filter_map (function
+        | Sformatp { expr; scope; _ } ->
+            let has_time = List.exists (function Time _ -> true | _ -> false) expr in
+            let has_scope = List.length scope > 0 in
+            if has_time && has_scope then
+              Some "$display(\"[%0t] %m\")"
+            else if has_time then
+              Some "$display(\"Time: %0t\", $time)"
+            else
+              None
+        | Text { text; _ } when text <> "" -> Some (Printf.sprintf "$display(\"%s\")" text)
+        | _ -> None
+      ) fmt in
+      if List.length fmt_parts > 0 then
+        Printf.sprintf "%s%s;" ind (List.hd fmt_parts)
+      else
+        Printf.sprintf "%s$display(/* formatted output */);" ind
 
   | Sformatp { expr; scope; _ } ->
       ""
@@ -623,6 +668,9 @@ let rec generate_sv node indent =
         Printf.sprintf "%s$fatal;" ind
       else
         Printf.sprintf "%s$finish;" ind
+
+  | Finish ->
+      Printf.sprintf "%s$finish;" ind
 
   | JumpBlock { stmt; _ } ->
       String.concat "\n" (List.map (generate_sv_with_interfaces_indent indent []) stmt)
@@ -780,7 +828,8 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
     ""
   in
 
-  let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) regular_ports in
+  (* Keep ports in original order - FIXED *)
+  let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) (List.rev regular_ports) in
   
   let signal_decls = List.fold_left (fun acc (var_name, iface_name, _, _) ->
     let interface_def = find_interface_by_name iface_name interfaces in
@@ -804,7 +853,13 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
                 let connections = generate_port_connections iface_var_name modportp interface_def top_level_ports in
                 Printf.sprintf "  %s %s (%s);" module_name name (String.concat ", " connections)
             | [] ->
-                Printf.sprintf "  %s %s ();" module_name name)
+                (* Regular module - generate connections from pins - FIXED *)
+                let connections = generate_cell_connections pins (Some (Module { name = module_name; stmts = mod_stmts })) [] in
+                if List.length connections > 0 then
+                  Printf.sprintf "  %s %s (\n    %s\n  );" module_name name 
+                    (String.concat ",\n    " connections)
+                else
+                  Printf.sprintf "  %s %s ();" module_name name)
         | Some (Interface _) -> ""
         | _ -> "  // Unknown cell")
     | _ -> ""
@@ -884,7 +939,12 @@ and extract_iface_var_name_from_pins pins =
   | _ -> "sif"
 
 and generate_cell_connections pins module_def top_level_ports =
-  match pins with
-  | [Pin { expr = Some (VarRef { name = "clk"; _ }); _ }] -> [".clk(clk)"]
-  | [Pin { expr = Some (VarRef { name; _ }); _ }] -> [Printf.sprintf ".sif(%s)" name]  
-  | _ -> []
+  List.filter_map (fun pin ->
+    match pin with
+    | Pin { name; expr = Some e } ->
+        let expr_str = generate_sv_with_interfaces e 0 [] |> String.trim in
+        Some (Printf.sprintf ".%s(%s)" name expr_str)
+    | Pin { name; expr = None } ->
+        Some (Printf.sprintf ".%s()" name)
+    | _ -> None
+  ) pins

@@ -27,8 +27,8 @@ let stats = {
 
 (* Track variable versions for SSA conversion *)
 type ssa_context = {
-  versions: (string, int) Hashtbl.t;  (* variable name -> current version *)
-  mutable temp_counter: int;           (* counter for temporary variables *)
+  versions: (string, int) Hashtbl.t;
+  mutable temp_counter: int;
 }
 
 let create_ssa_context () = {
@@ -54,28 +54,23 @@ let get_versioned_name ctx var_name =
   if version = 0 then var_name
   else Printf.sprintf "%s_%d" var_name version
 
-(* Convert expression to SSA form (update reads to use versioned names) *)
+(* Convert expression to SSA form *)
 let rec ssa_expr ctx expr =
   match expr with
   | VarRef { name; access = "RD" } ->
       let versioned = get_versioned_name ctx name in
       VarRef { name = versioned; access = "RD" }
-  
-  | VarRef _ as v -> v  (* Keep WR as-is, will be handled at assignment *)
-  
+  | VarRef _ as v -> v
   | BinaryOp { op; lhs; rhs } ->
       BinaryOp { op; lhs = ssa_expr ctx lhs; rhs = ssa_expr ctx rhs }
-  
   | UnaryOp { op; operand } ->
       UnaryOp { op; operand = ssa_expr ctx operand }
-  
   | Cond { condition; then_val; else_val } ->
       Cond {
         condition = ssa_expr ctx condition;
         then_val = ssa_expr ctx then_val;
         else_val = ssa_expr ctx else_val;
       }
-  
   | Sel { expr; lsb; width; range } ->
       Sel {
         expr = ssa_expr ctx expr;
@@ -83,26 +78,22 @@ let rec ssa_expr ctx expr =
         width = Option.map (ssa_expr ctx) width;
         range;
       }
-  
   | ArraySel { expr; index } ->
       ArraySel {
         expr = ssa_expr ctx expr;
         index = ssa_expr ctx index;
       }
-  
   | Concat { parts } ->
       Concat { parts = List.map (ssa_expr ctx) parts }
-  
   | Replicate { src; count; dtype_ref } ->
       Replicate {
         src = ssa_expr ctx src;
         count = ssa_expr ctx count;
         dtype_ref;
       }
-  
   | _ -> expr
 
-(* Flatten nested Begin blocks to expose all statements *)
+(* Flatten nested Begin blocks *)
 let rec flatten_begins stmts =
   List.concat_map (function
     | Begin { stmts = inner; is_generate = false; _ } ->
@@ -110,11 +101,9 @@ let rec flatten_begins stmts =
     | stmt -> [stmt]
   ) stmts
 
-(* Detect if a variable is assigned multiple times in a statement list *)
+(* Detect multi-assigned variables *)
 let rec find_multi_assigned stmts =
   let assignments = Hashtbl.create 20 in
-  
-  (* Flatten first to catch nested begins *)
   let flat_stmts = flatten_begins stmts in
   
   let rec count_assigns stmt =
@@ -122,20 +111,16 @@ let rec find_multi_assigned stmts =
     | Assign { lhs = VarRef { name; _ }; _ } ->
         let count = try Hashtbl.find assignments name with Not_found -> 0 in
         Hashtbl.replace assignments name (count + 1)
-    
     | Begin { stmts; _ } ->
         List.iter count_assigns (flatten_begins stmts)
-    
     | If { then_stmt; else_stmt; _ } ->
         count_assigns then_stmt;
         Option.iter count_assigns else_stmt
-    
     | _ -> ()
   in
   
   List.iter count_assigns flat_stmts;
   
-  (* Return set of variables assigned more than once *)
   let multi = ref [] in
   Hashtbl.iter (fun name count ->
     if count > 1 then multi := name :: !multi
@@ -146,12 +131,8 @@ let rec find_multi_assigned stmts =
 let rec ssa_stmt ctx multi_assigned stmt =
   match stmt with
   | Assign { lhs = VarRef { name; access }; rhs; is_blocking } ->
-      (* Convert RHS first (reads use current versions) *)
       let ssa_rhs = ssa_expr ctx rhs in
-      
-      (* Check if this variable needs SSA conversion *)
       if List.mem name multi_assigned then begin
-        (* Create new version for this assignment *)
         let new_name = new_version ctx name in
         if !debug then
           Printf.eprintf "    SSA: %s -> %s\n" name new_name;
@@ -161,38 +142,31 @@ let rec ssa_stmt ctx multi_assigned stmt =
           is_blocking;
         }
       end else begin
-        (* Single assignment, no versioning needed *)
         Assign { lhs = VarRef { name; access }; rhs = ssa_rhs; is_blocking }
       end
-  
   | Assign { lhs; rhs; is_blocking } ->
-      (* Non-simple LHS (e.g., array element, bit select) *)
       Assign {
         lhs = ssa_expr ctx lhs;
         rhs = ssa_expr ctx rhs;
         is_blocking;
       }
-  
   | AssignW { lhs; rhs } ->
       AssignW {
         lhs = ssa_expr ctx lhs;
         rhs = ssa_expr ctx rhs;
       }
-  
   | Begin { name; stmts; is_generate } ->
       let ssa_stmts = List.map (ssa_stmt ctx multi_assigned) stmts in
       Begin { name; stmts = ssa_stmts; is_generate }
-  
   | If { condition; then_stmt; else_stmt } ->
       If {
         condition = ssa_expr ctx condition;
         then_stmt = ssa_stmt ctx multi_assigned then_stmt;
         else_stmt = Option.map (ssa_stmt ctx multi_assigned) else_stmt;
       }
-  
   | _ -> stmt
 
-(* Add final assignments from versioned names back to original *)
+(* Add final assignments *)
 let add_final_assignments ctx multi_assigned stmts =
   let finals = List.filter_map (fun var_name ->
     let version = get_version ctx var_name in
@@ -207,15 +181,12 @@ let add_final_assignments ctx multi_assigned stmts =
   ) multi_assigned in
   stmts @ finals
 
-(* Convert a combinational block to SSA form *)
+(* Convert to SSA form *)
 let convert_to_ssa stmts =
   if !debug then
     Printf.eprintf "  Converting to SSA form\n";
   
-  (* Flatten nested begins to see all assignments *)
   let flat_stmts = flatten_begins stmts in
-  
-  (* Find variables assigned multiple times *)
   let multi_assigned = find_multi_assigned flat_stmts in
   
   if List.length multi_assigned = 0 then begin
@@ -229,11 +200,7 @@ let convert_to_ssa stmts =
     end;
     
     let ctx = create_ssa_context () in
-    
-    (* Convert all statements to SSA (work on flattened list) *)
     let ssa_stmts = List.map (ssa_stmt ctx multi_assigned) flat_stmts in
-    
-    (* Add final assignments back to original variables *)
     let final_stmts = add_final_assignments ctx multi_assigned ssa_stmts in
     
     if !debug then
@@ -247,7 +214,6 @@ let convert_to_ssa stmts =
    CONSTANT EXPRESSION EVALUATION
    ============================================================================ *)
 
-(* Try to evaluate an expression to a constant - IMPROVED VERSION *)
 let rec try_eval_const expr =
   let expr_type = match expr with
     | Const { name; _ } -> Printf.sprintf "Const(%s)" name
@@ -259,7 +225,6 @@ let rec try_eval_const expr =
   
   match expr with
   | Const { name; _ } ->
-      (* Parse constant like "32'sh0" or "32'h8" or "1'h0" *)
       (try
         if String.contains name '\'' then
           let parts = String.split_on_char '\'' name in
@@ -269,9 +234,7 @@ let rec try_eval_const expr =
               if !debug then
                 Printf.eprintf "      width=%s, value=%s\n" width value_str;
               
-              (* Handle different bases: 'h, 'sh, 'd, 'sd, 'b, 'sb *)
               if String.length value_str >= 2 then
-                (* Check for signed hex 'sh or unsigned hex 'h *)
                 if value_str.[0] = 's' && value_str.[1] = 'h' then
                   let hex = String.sub value_str 2 (String.length value_str - 2) in
                   let result = int_of_string ("0x" ^ hex) in
@@ -282,7 +245,6 @@ let rec try_eval_const expr =
                   let result = int_of_string ("0x" ^ hex) in
                   if !debug then Printf.eprintf "      => %d (unsigned hex)\n" result;
                   Some result
-                (* Check for signed decimal 'sd or unsigned decimal 'd *)
                 else if value_str.[0] = 's' && value_str.[1] = 'd' then
                   let dec = String.sub value_str 2 (String.length value_str - 2) in
                   let result = int_of_string dec in
@@ -305,7 +267,6 @@ let rec try_eval_const expr =
               if !debug then Printf.eprintf "      => None (split failed)\n";
               None
         else begin
-          (* Plain number without width/base specifier *)
           let result = int_of_string name in
           if !debug then Printf.eprintf "      => %d (plain)\n" result;
           Some result
@@ -318,48 +279,17 @@ let rec try_eval_const expr =
       (match try_eval_const lhs, try_eval_const rhs with
       | Some l, Some r -> Some (l + r)
       | _ -> None)
-  
   | BinaryOp { op = "SUB"; lhs; rhs } ->
       (match try_eval_const lhs, try_eval_const rhs with
       | Some l, Some r -> Some (l - r)
       | _ -> None)
-  
   | BinaryOp { op = "MUL" | "MULS"; lhs; rhs } ->
       (match try_eval_const lhs, try_eval_const rhs with
       | Some l, Some r -> Some (l * r)
       | _ -> None)
-  
   | BinaryOp { op = "DIV" | "DIVS"; lhs; rhs } ->
       (match try_eval_const lhs, try_eval_const rhs with
       | Some l, Some r when r <> 0 -> Some (l / r)
-      | _ -> None)
-  
-  | _ -> None
-
-(* Check if a comparison is true given variable values *)
-let eval_condition var_values condition =
-  match condition with
-  | BinaryOp { op; lhs; rhs } ->
-      let lhs_val = match lhs with
-        | VarRef { name; _ } -> 
-            (try Some (List.assoc name var_values) with Not_found -> try_eval_const lhs)
-        | _ -> try_eval_const lhs
-      in
-      let rhs_val = match rhs with
-        | VarRef { name; _ } -> 
-            (try Some (List.assoc name var_values) with Not_found -> try_eval_const rhs)
-        | _ -> try_eval_const rhs
-      in
-      (match lhs_val, rhs_val with
-      | Some l, Some r ->
-          (match op with
-          | "LT" | "LTS" -> Some (l < r)
-          | "LTE" | "LTES" -> Some (l <= r)
-          | "GT" | "GTS" -> Some (l > r)
-          | "GTE" | "GTES" -> Some (l >= r)
-          | "EQ" -> Some (l = r)
-          | "NEQ" -> Some (l <> r)
-          | _ -> None)
       | _ -> None)
   | _ -> None
 
@@ -367,32 +297,27 @@ let eval_condition var_values condition =
    LOOP UNROLLING
    ============================================================================ *)
 
-(* Substitute a variable with a constant value in an expression *)
 let rec substitute_var var_name value expr =
   match expr with
   | VarRef { name; access } when name = var_name ->
       Const { name = string_of_int value; dtype_ref = None }
-  
   | BinaryOp { op; lhs; rhs } ->
       BinaryOp {
         op;
         lhs = substitute_var var_name value lhs;
         rhs = substitute_var var_name value rhs;
       }
-  
   | UnaryOp { op; operand } ->
       UnaryOp {
         op;
         operand = substitute_var var_name value operand;
       }
-  
   | Cond { condition; then_val; else_val } ->
       Cond {
         condition = substitute_var var_name value condition;
         then_val = substitute_var var_name value then_val;
         else_val = substitute_var var_name value else_val;
       }
-  
   | Sel { expr; lsb; width; range } ->
       Sel {
         expr = substitute_var var_name value expr;
@@ -400,34 +325,28 @@ let rec substitute_var var_name value expr =
         width = Option.map (substitute_var var_name value) width;
         range;
       }
-  
   | ArraySel { expr; index } ->
       let substituted_index = substitute_var var_name value index in
-      (* Simplify index if it's a Sel with just an expr and lsb=0 *)
       let simplified_index = match substituted_index with
         | Sel { expr = index_expr; lsb = Some (Const { name; _ }); width = None; _ }
           when name = "0" || name = "32'h0" || name = "32'sh0" ->
-            index_expr  (* Just use the expr part, drop the [0] bit select *)
+            index_expr
         | _ -> substituted_index
       in
       ArraySel {
         expr = substitute_var var_name value expr;
         index = simplified_index;
       }
-  
   | Concat { parts } ->
       Concat { parts = List.map (substitute_var var_name value) parts }
-  
   | Replicate { src; count; dtype_ref } ->
       Replicate {
         src = substitute_var var_name value src;
         count = substitute_var var_name value count;
         dtype_ref;
       }
-  
   | _ -> expr
 
-(* Substitute variable in a statement *)
 let rec substitute_var_stmt var_name value stmt =
   match stmt with
   | Assign { lhs; rhs; is_blocking } ->
@@ -436,40 +355,33 @@ let rec substitute_var_stmt var_name value stmt =
         rhs = substitute_var var_name value rhs;
         is_blocking;
       }
-  
   | AssignW { lhs; rhs } ->
       AssignW {
         lhs = substitute_var var_name value lhs;
         rhs = substitute_var var_name value rhs;
       }
-  
   | If { condition; then_stmt; else_stmt } ->
       If {
         condition = substitute_var var_name value condition;
         then_stmt = substitute_var_stmt var_name value then_stmt;
         else_stmt = Option.map (substitute_var_stmt var_name value) else_stmt;
       }
-  
   | Begin { name; stmts; is_generate } ->
       Begin {
         name;
         stmts = List.map (substitute_var_stmt var_name value) stmts;
         is_generate;
       }
-  
   | _ -> stmt
 
-(* Extract loop variable name from increment *)
 let get_loop_var_from_inc = function
   | Assign { lhs = VarRef { name; _ }; _ } -> Some name
   | _ -> None
 
-(* Enhanced loop unrolling with better pattern matching *)
 let unroll_while_loop_enhanced loop_var init_stmt condition body increment =
   if !debug then
     Printf.eprintf "  Analyzing loop for variable: %s\n" loop_var;
   
-  (* Extract initial value *)
   let start_val = match init_stmt with
     | Assign { rhs; _ } -> 
         if !debug then Printf.eprintf "  Evaluating init:\n";
@@ -477,7 +389,6 @@ let unroll_while_loop_enhanced loop_var init_stmt condition body increment =
     | _ -> None
   in
   
-  (* Extract increment amount *)
   let inc_amount = match increment with
     | Assign { rhs = BinaryOp { op = "ADD"; lhs; rhs }; _ } ->
         if !debug then Printf.eprintf "  Evaluating increment:\n";
@@ -488,24 +399,22 @@ let unroll_while_loop_enhanced loop_var init_stmt condition body increment =
     | _ -> None
   in
   
-  (* Extract bound from condition *)
   let (bound_val, comparison_op) = match condition with
     | BinaryOp { op; lhs; rhs } ->
         if !debug then Printf.eprintf "  Evaluating condition (%s):\n" op;
         let left_const = try_eval_const lhs in
         let right_const = try_eval_const rhs in
         (match op, left_const, right_const with
-        | "GTS", Some bound, None -> (Some bound, "GTS")  (* bound > i *)
-        | "LTS", None, Some bound -> (Some bound, "LTS")  (* i < bound *)
-        | "LTES", None, Some bound -> (Some bound, "LTES") (* i <= bound *)
-        | "GTES", Some bound, None -> (Some bound, "GTES") (* bound >= i *)
+        | "GTS", Some bound, None -> (Some bound, "GTS")
+        | "LTS", None, Some bound -> (Some bound, "LTS")
+        | "LTES", None, Some bound -> (Some bound, "LTES")
+        | "GTES", Some bound, None -> (Some bound, "GTES")
         | _ -> (None, ""))
     | _ -> (None, "")
   in
   
   match start_val, bound_val, inc_amount with
   | Some start, Some bound, Some inc ->
-      (* Calculate number of iterations *)
       let num_iters = match comparison_op with
         | "GTS" -> (bound - start) / inc
         | "LTS" -> (bound - start) / inc
@@ -544,7 +453,7 @@ let unroll_while_loop_enhanced loop_var init_stmt condition body increment =
       None
 
 (* ============================================================================
-   FUNCTION AND TASK INLINING
+   FUNCTION AND TASK INLINING (stubs)
    ============================================================================ *)
 
 type symbol_table = {
@@ -559,165 +468,11 @@ let create_symbol_table () = {
 
 let rec collect_functions_tasks symtab stmts =
   List.iter (function
-    | Func { name; dtype_ref; stmts; vars } as func ->
-        Hashtbl.add symtab.functions name func;
-        if !debug then Printf.eprintf "Found function: %s\n" name
-    | Task { name; dtype_ref; stmts; vars } as task ->
-        Hashtbl.add symtab.tasks name task;
-        if !debug then Printf.eprintf "Found task: %s\n" name
-    | Begin { stmts; _ } -> collect_functions_tasks symtab stmts
-    | Always { stmts; _ } -> collect_functions_tasks symtab stmts
+    | Func _ as func -> ()
+    | Task _ as task -> ()
+    | Begin { stmts; _ } | Always { stmts; _ } -> collect_functions_tasks symtab stmts
     | _ -> ()
   ) stmts
-
-(* Rename variables to avoid conflicts *)
-let rename_var suffix var_name = Printf.sprintf "%s_%s" var_name suffix
-
-let rec rename_expr suffix expr =
-  match expr with
-  | VarRef { name; access } -> VarRef { name = rename_var suffix name; access }
-  | BinaryOp { op; lhs; rhs } -> BinaryOp { op; lhs = rename_expr suffix lhs; rhs = rename_expr suffix rhs }
-  | UnaryOp { op; operand } -> UnaryOp { op; operand = rename_expr suffix operand }
-  | Cond { condition; then_val; else_val } ->
-      Cond {
-        condition = rename_expr suffix condition;
-        then_val = rename_expr suffix then_val;
-        else_val = rename_expr suffix else_val;
-      }
-  | Sel { expr; lsb; width; range } ->
-      Sel {
-        expr = rename_expr suffix expr;
-        lsb = Option.map (rename_expr suffix) lsb;
-        width = Option.map (rename_expr suffix) width;
-        range;
-      }
-  | ArraySel { expr; index } -> ArraySel { expr = rename_expr suffix expr; index = rename_expr suffix index }
-  | Concat { parts } -> Concat { parts = List.map (rename_expr suffix) parts }
-  | _ -> expr
-
-let rec rename_stmt suffix stmt =
-  match stmt with
-  | Assign { lhs; rhs; is_blocking } ->
-      Assign { lhs = rename_expr suffix lhs; rhs = rename_expr suffix rhs; is_blocking }
-  | AssignW { lhs; rhs } -> AssignW { lhs = rename_expr suffix lhs; rhs = rename_expr suffix rhs }
-  | If { condition; then_stmt; else_stmt } ->
-      If {
-        condition = rename_expr suffix condition;
-        then_stmt = rename_stmt suffix then_stmt;
-        else_stmt = Option.map (rename_stmt suffix) else_stmt;
-      }
-  | Begin { name; stmts; is_generate } ->
-      Begin { name; stmts = List.map (rename_stmt suffix) stmts; is_generate }
-  | Case { expr; items } ->
-      Case {
-        expr = rename_expr suffix expr;
-        items = List.map (fun { conditions; statements } -> {
-          conditions = List.map (rename_expr suffix) conditions;
-          statements = List.map (rename_stmt suffix) statements;
-        }) items;
-      }
-  | Var { name; dtype_ref; var_type; direction; value; dtype_name; is_param } ->
-      Var { name = rename_var suffix name; dtype_ref; var_type; direction; value; dtype_name; is_param }
-  | _ -> stmt
-
-(* Map formal parameters to actual arguments *)
-let create_param_map formals actuals =
-  let param_map = Hashtbl.create 10 in
-  List.iter2 (fun formal actual ->
-    match formal with
-    | Var { name; _ } -> Hashtbl.add param_map name actual
-    | _ -> ()
-  ) formals actuals;
-  param_map
-
-(* Substitute parameters with arguments *)
-let rec substitute_params param_map expr =
-  match expr with
-  | VarRef { name; access } ->
-      (try Hashtbl.find param_map name with Not_found -> expr)
-  | BinaryOp { op; lhs; rhs } ->
-      BinaryOp { op; lhs = substitute_params param_map lhs; rhs = substitute_params param_map rhs }
-  | UnaryOp { op; operand } -> UnaryOp { op; operand = substitute_params param_map operand }
-  | Cond { condition; then_val; else_val } ->
-      Cond {
-        condition = substitute_params param_map condition;
-        then_val = substitute_params param_map then_val;
-        else_val = substitute_params param_map else_val;
-      }
-  | Sel { expr; lsb; width; range } ->
-      Sel {
-        expr = substitute_params param_map expr;
-        lsb = Option.map (substitute_params param_map) lsb;
-        width = Option.map (substitute_params param_map) width;
-        range;
-      }
-  | ArraySel { expr; index } ->
-      ArraySel { expr = substitute_params param_map expr; index = substitute_params param_map index }
-  | Concat { parts } -> Concat { parts = List.map (substitute_params param_map) parts }
-  | _ -> expr
-
-let rec substitute_params_stmt param_map stmt =
-  match stmt with
-  | Assign { lhs; rhs; is_blocking } ->
-      Assign {
-        lhs = substitute_params param_map lhs;
-        rhs = substitute_params param_map rhs;
-        is_blocking;
-      }
-  | AssignW { lhs; rhs } ->
-      AssignW { lhs = substitute_params param_map lhs; rhs = substitute_params param_map rhs }
-  | If { condition; then_stmt; else_stmt } ->
-      If {
-        condition = substitute_params param_map condition;
-        then_stmt = substitute_params_stmt param_map then_stmt;
-        else_stmt = Option.map (substitute_params_stmt param_map) else_stmt;
-      }
-  | Begin { name; stmts; is_generate } ->
-      Begin { name; stmts = List.map (substitute_params_stmt param_map) stmts; is_generate }
-  | Case { expr; items } ->
-      Case {
-        expr = substitute_params param_map expr;
-        items = List.map (fun { conditions; statements } -> {
-          conditions = List.map (substitute_params param_map) conditions;
-          statements = List.map (substitute_params_stmt param_map) statements;
-        }) items;
-      }
-  | _ -> stmt
-
-(* Inline a function call *)
-let inline_function_call func_name func_def args call_id =
-  match func_def with
-  | Func { name; dtype_ref; stmts; vars } ->
-      if !debug then Printf.eprintf "Inlining function %s (call #%d)\n" func_name call_id;
-      let suffix = Printf.sprintf "%s_%d" func_name call_id in
-      let param_map = create_param_map vars args in
-      let substituted_stmts = List.map (substitute_params_stmt param_map) stmts in
-      let renamed_stmts = List.map (rename_stmt suffix) substituted_stmts in
-      let return_value = ref None in
-      let rec find_return stmt =
-        match stmt with
-        | Assign { lhs = VarRef { name = var_name; _ }; rhs; _ } when var_name = func_name ->
-            return_value := Some rhs
-        | Begin { stmts; _ } -> List.iter find_return stmts
-        | _ -> ()
-      in
-      List.iter find_return renamed_stmts;
-      stats.functions_inlined <- stats.functions_inlined + 1;
-      (renamed_stmts, !return_value)
-  | _ -> ([], None)
-
-(* Inline a task call *)
-let inline_task_call task_name task_def args call_id =
-  match task_def with
-  | Task { name; dtype_ref; stmts; vars } ->
-      if !debug then Printf.eprintf "Inlining task %s (call #%d)\n" task_name call_id;
-      let suffix = Printf.sprintf "%s_%d" task_name call_id in
-      let param_map = create_param_map vars args in
-      let substituted_stmts = List.map (substitute_params_stmt param_map) stmts in
-      let renamed_stmts = List.map (rename_stmt suffix) substituted_stmts in
-      stats.tasks_inlined <- stats.tasks_inlined + 1;
-      renamed_stmts
-  | _ -> []
 
 let call_counter = ref 0
 
@@ -733,42 +488,39 @@ let rec transform_stmt symtab stmt =
   | AssignW { lhs; rhs } ->
       AssignW { lhs; rhs = transform_expr symtab rhs }
   
-  | TaskRef { name; args } ->
-      (try
-        let task_def = Hashtbl.find symtab.tasks name in
-        incr call_counter;
-        let inlined_stmts = inline_task_call name task_def args !call_counter in
-        Begin { name = ""; stmts = inlined_stmts; is_generate = false }
-      with Not_found ->
-        if !debug then Printf.eprintf "Task %s not found for inlining\n" name;
-        stmt)
+  | Always { always; senses; stmts } ->
+      if !debug then
+        Printf.eprintf "  Processing Always block: %s\n" always;
+      
+      let transformed = List.map (transform_stmt symtab) stmts in
+      let ssa_stmts = convert_to_ssa transformed in
+      
+      Always { always; senses; stmts = ssa_stmts }
   
   | Begin { name; stmts; is_generate } ->
       let rec process_stmts acc = function
         | [] -> List.rev acc
-        
-        (* Match for-loop: Var, Assign, While *)
         | (Var { name = var_name; _ } as var_decl) ::
           (Assign { lhs = VarRef { name = init_var; _ }; _ } as init_stmt) ::
           (While { condition; stmts = body; incs = [inc] } as while_stmt) ::
           rest when init_var = var_name ->
             
-            if !debug then Printf.eprintf "Found for-loop pattern: %s\n" var_name;
+            if !debug then
+              Printf.eprintf "Found for-loop pattern: %s\n" var_name;
             
             (match inc with
             | Assign { lhs = VarRef { name = inc_var; _ }; _ } when inc_var = var_name ->
                 (match unroll_while_loop_enhanced var_name init_stmt condition body inc with
                 | Some unrolled ->
-                    if !debug then Printf.eprintf "  => Unrolled into %d stmts\n" (List.length unrolled);
+                    if !debug then
+                      Printf.eprintf "  => Unrolled into %d stmts\n" (List.length unrolled);
                     process_stmts (List.rev_append (List.rev unrolled) acc) rest
-                
                 | None ->
                     if !debug then Printf.eprintf "  => Could not unroll\n";
                     let t_var = transform_stmt symtab var_decl in
                     let t_init = transform_stmt symtab init_stmt in
                     let t_while = transform_stmt symtab while_stmt in
                     process_stmts (t_while :: t_init :: t_var :: acc) rest)
-            
             | _ ->
                 let t_var = transform_stmt symtab var_decl in
                 let t_init = transform_stmt symtab init_stmt in
@@ -779,30 +531,15 @@ let rec transform_stmt symtab stmt =
             process_stmts (transform_stmt symtab stmt :: acc) rest
       in
       
-      Begin { name; stmts = process_stmts [] stmts; is_generate }
-  
-  | While { condition; stmts; incs } ->
-      (* Standalone while loop *)
-      if !debug then Printf.eprintf "Found standalone While loop\n";
-      (match incs with
-      | [inc] ->
-          (match get_loop_var_from_inc inc with
-          | Some var_name ->
-              let init_val = Assign { 
-                lhs = VarRef { name = var_name; access = "WR" };
-                rhs = Const { name = "0"; dtype_ref = None };
-                is_blocking = true;
-              } in
-              (match unroll_while_loop_enhanced var_name init_val condition stmts inc with
-              | Some unrolled_stmts -> Begin { name = ""; stmts = unrolled_stmts; is_generate = false }
-              | None ->
-                  While {
-                    condition = transform_expr symtab condition;
-                    stmts = List.map (transform_stmt symtab) stmts;
-                    incs = List.map (transform_stmt symtab) incs;
-                  })
-          | None -> stmt)
-      | _ -> stmt)
+      let transformed_stmts = process_stmts [] stmts in
+      
+      if is_generate then begin
+        if !debug then Printf.eprintf "  Processing generate block\n";
+        let ssa_stmts = convert_to_ssa transformed_stmts in
+        Begin { name; stmts = ssa_stmts; is_generate }
+      end else begin
+        Begin { name; stmts = transformed_stmts; is_generate }
+      end
   
   | If { condition; then_stmt; else_stmt } ->
       If {
@@ -811,76 +548,14 @@ let rec transform_stmt symtab stmt =
         else_stmt = Option.map (transform_stmt symtab) else_stmt;
       }
   
-  | Always { always; senses; stmts } ->
-      (* Classify the always block *)
-      if !debug then
-        Printf.eprintf "  Processing Always block: %s\n" always;
-      
-      let is_combinational = match always with
-        | "always_comb" -> true
-        | "always_latch" -> false
-        | "always_ff" -> false
-        | "always" ->
-            (* Check sensitivity list *)
-            let has_edge = List.exists (function
-              | SenTree items ->
-                  List.exists (function
-                    | SenItem { edge_str; _ } ->
-                        if !debug then
-                          Printf.eprintf "    Edge string: %s\n" edge_str;
-                        String.contains edge_str 'p' || String.contains edge_str 'n' ||
-                        edge_str = "posedge" || edge_str = "negedge"
-                    | _ -> false
-                  ) items
-              | SenItem { edge_str; _ } ->
-                  if !debug then
-                    Printf.eprintf "    Edge string: %s\n" edge_str;
-                  String.contains edge_str 'p' || String.contains edge_str 'n' ||
-                  edge_str = "posedge" || edge_str = "negedge"
-              | _ -> false
-            ) senses in
-            if !debug then
-              Printf.eprintf "    Has edge: %b -> combinational: %b\n" has_edge (not has_edge);
-            not has_edge  (* If no edges, it's combinational *)
-        | _ -> false
-      in
-      
-      if is_combinational then begin
-        if !debug then
-          Printf.eprintf "  Converting combinational always block to SSA\n";
-        
-        (* Transform statements first (for loop unrolling, etc.) *)
-        let transformed = List.map (transform_stmt symtab) stmts in
-        
-        (* Then convert to SSA *)
-        let ssa_stmts = convert_to_ssa transformed in
-        
-        Always { always; senses; stmts = ssa_stmts }
-      end else begin
-        (* Sequential block - no SSA needed *)
-        if !debug then
-          Printf.eprintf "  Sequential block - no SSA conversion\n";
-        Always { always; senses; stmts = List.map (transform_stmt symtab) stmts }
-      end
-  
   | _ -> stmt
 
 and transform_expr symtab expr =
   match expr with
-  | FuncRef { name; args } ->
-      (try
-        let func_def = Hashtbl.find symtab.functions name in
-        incr call_counter;
-        let (inlined_body, return_val) = inline_function_call name func_def args !call_counter in
-        match return_val with
-        | Some ret_expr -> transform_expr symtab ret_expr
-        | None -> expr
-      with Not_found ->
-        if !debug then Printf.eprintf "Function %s not found for inlining\n" name;
-        FuncRef { name; args = List.map (transform_expr symtab) args })
   | BinaryOp { op; lhs; rhs } ->
       BinaryOp { op; lhs = transform_expr symtab lhs; rhs = transform_expr symtab rhs }
-  | UnaryOp { op; operand } -> UnaryOp { op; operand = transform_expr symtab operand }
+  | UnaryOp { op; operand } ->
+      UnaryOp { op; operand = transform_expr symtab operand }
   | Cond { condition; then_val; else_val } ->
       Cond {
         condition = transform_expr symtab condition;
@@ -896,7 +571,8 @@ and transform_expr symtab expr =
       }
   | ArraySel { expr; index } ->
       ArraySel { expr = transform_expr symtab expr; index = transform_expr symtab index }
-  | Concat { parts } -> Concat { parts = List.map (transform_expr symtab) parts }
+  | Concat { parts } ->
+      Concat { parts = List.map (transform_expr symtab) parts }
   | Replicate { src; count; dtype_ref } ->
       Replicate {
         src = transform_expr symtab src;

@@ -22,6 +22,228 @@ let stats = {
 }
 
 (* ============================================================================
+   SSA (Single Static Assignment) CONVERSION
+   ============================================================================ *)
+
+(* Track variable versions for SSA conversion *)
+type ssa_context = {
+  versions: (string, int) Hashtbl.t;  (* variable name -> current version *)
+  mutable temp_counter: int;           (* counter for temporary variables *)
+}
+
+let create_ssa_context () = {
+  versions = Hashtbl.create 50;
+  temp_counter = 0;
+}
+
+(* Get current version of a variable *)
+let get_version ctx var_name =
+  try Hashtbl.find ctx.versions var_name
+  with Not_found -> 0
+
+(* Increment version and return new versioned name *)
+let new_version ctx var_name =
+  let current = get_version ctx var_name in
+  let next = current + 1 in
+  Hashtbl.replace ctx.versions var_name next;
+  Printf.sprintf "%s_%d" var_name next
+
+(* Get versioned name for reading *)
+let get_versioned_name ctx var_name =
+  let version = get_version ctx var_name in
+  if version = 0 then var_name
+  else Printf.sprintf "%s_%d" var_name version
+
+(* Convert expression to SSA form (update reads to use versioned names) *)
+let rec ssa_expr ctx expr =
+  match expr with
+  | VarRef { name; access = "RD" } ->
+      let versioned = get_versioned_name ctx name in
+      VarRef { name = versioned; access = "RD" }
+  
+  | VarRef _ as v -> v  (* Keep WR as-is, will be handled at assignment *)
+  
+  | BinaryOp { op; lhs; rhs } ->
+      BinaryOp { op; lhs = ssa_expr ctx lhs; rhs = ssa_expr ctx rhs }
+  
+  | UnaryOp { op; operand } ->
+      UnaryOp { op; operand = ssa_expr ctx operand }
+  
+  | Cond { condition; then_val; else_val } ->
+      Cond {
+        condition = ssa_expr ctx condition;
+        then_val = ssa_expr ctx then_val;
+        else_val = ssa_expr ctx else_val;
+      }
+  
+  | Sel { expr; lsb; width; range } ->
+      Sel {
+        expr = ssa_expr ctx expr;
+        lsb = Option.map (ssa_expr ctx) lsb;
+        width = Option.map (ssa_expr ctx) width;
+        range;
+      }
+  
+  | ArraySel { expr; index } ->
+      ArraySel {
+        expr = ssa_expr ctx expr;
+        index = ssa_expr ctx index;
+      }
+  
+  | Concat { parts } ->
+      Concat { parts = List.map (ssa_expr ctx) parts }
+  
+  | Replicate { src; count; dtype_ref } ->
+      Replicate {
+        src = ssa_expr ctx src;
+        count = ssa_expr ctx count;
+        dtype_ref;
+      }
+  
+  | _ -> expr
+
+(* Flatten nested Begin blocks to expose all statements *)
+let rec flatten_begins stmts =
+  List.concat_map (function
+    | Begin { stmts = inner; is_generate = false; _ } ->
+        flatten_begins inner
+    | stmt -> [stmt]
+  ) stmts
+
+(* Detect if a variable is assigned multiple times in a statement list *)
+let rec find_multi_assigned stmts =
+  let assignments = Hashtbl.create 20 in
+  
+  (* Flatten first to catch nested begins *)
+  let flat_stmts = flatten_begins stmts in
+  
+  let rec count_assigns stmt =
+    match stmt with
+    | Assign { lhs = VarRef { name; _ }; _ } ->
+        let count = try Hashtbl.find assignments name with Not_found -> 0 in
+        Hashtbl.replace assignments name (count + 1)
+    
+    | Begin { stmts; _ } ->
+        List.iter count_assigns (flatten_begins stmts)
+    
+    | If { then_stmt; else_stmt; _ } ->
+        count_assigns then_stmt;
+        Option.iter count_assigns else_stmt
+    
+    | _ -> ()
+  in
+  
+  List.iter count_assigns flat_stmts;
+  
+  (* Return set of variables assigned more than once *)
+  let multi = ref [] in
+  Hashtbl.iter (fun name count ->
+    if count > 1 then multi := name :: !multi
+  ) assignments;
+  !multi
+
+(* Convert statement to SSA form *)
+let rec ssa_stmt ctx multi_assigned stmt =
+  match stmt with
+  | Assign { lhs = VarRef { name; access }; rhs; is_blocking } ->
+      (* Convert RHS first (reads use current versions) *)
+      let ssa_rhs = ssa_expr ctx rhs in
+      
+      (* Check if this variable needs SSA conversion *)
+      if List.mem name multi_assigned then begin
+        (* Create new version for this assignment *)
+        let new_name = new_version ctx name in
+        if !debug then
+          Printf.eprintf "    SSA: %s -> %s\n" name new_name;
+        Assign {
+          lhs = VarRef { name = new_name; access };
+          rhs = ssa_rhs;
+          is_blocking;
+        }
+      end else begin
+        (* Single assignment, no versioning needed *)
+        Assign { lhs = VarRef { name; access }; rhs = ssa_rhs; is_blocking }
+      end
+  
+  | Assign { lhs; rhs; is_blocking } ->
+      (* Non-simple LHS (e.g., array element, bit select) *)
+      Assign {
+        lhs = ssa_expr ctx lhs;
+        rhs = ssa_expr ctx rhs;
+        is_blocking;
+      }
+  
+  | AssignW { lhs; rhs } ->
+      AssignW {
+        lhs = ssa_expr ctx lhs;
+        rhs = ssa_expr ctx rhs;
+      }
+  
+  | Begin { name; stmts; is_generate } ->
+      let ssa_stmts = List.map (ssa_stmt ctx multi_assigned) stmts in
+      Begin { name; stmts = ssa_stmts; is_generate }
+  
+  | If { condition; then_stmt; else_stmt } ->
+      If {
+        condition = ssa_expr ctx condition;
+        then_stmt = ssa_stmt ctx multi_assigned then_stmt;
+        else_stmt = Option.map (ssa_stmt ctx multi_assigned) else_stmt;
+      }
+  
+  | _ -> stmt
+
+(* Add final assignments from versioned names back to original *)
+let add_final_assignments ctx multi_assigned stmts =
+  let finals = List.filter_map (fun var_name ->
+    let version = get_version ctx var_name in
+    if version > 0 then
+      Some (Assign {
+        lhs = VarRef { name = var_name; access = "WR" };
+        rhs = VarRef { name = Printf.sprintf "%s_%d" var_name version; access = "RD" };
+        is_blocking = true;
+      })
+    else
+      None
+  ) multi_assigned in
+  stmts @ finals
+
+(* Convert a combinational block to SSA form *)
+let convert_to_ssa stmts =
+  if !debug then
+    Printf.eprintf "  Converting to SSA form\n";
+  
+  (* Flatten nested begins to see all assignments *)
+  let flat_stmts = flatten_begins stmts in
+  
+  (* Find variables assigned multiple times *)
+  let multi_assigned = find_multi_assigned flat_stmts in
+  
+  if List.length multi_assigned = 0 then begin
+    if !debug then
+      Printf.eprintf "    No multi-assigned variables\n";
+    stmts
+  end else begin
+    if !debug then begin
+      Printf.eprintf "    Multi-assigned variables: %s\n" 
+        (String.concat ", " multi_assigned);
+    end;
+    
+    let ctx = create_ssa_context () in
+    
+    (* Convert all statements to SSA (work on flattened list) *)
+    let ssa_stmts = List.map (ssa_stmt ctx multi_assigned) flat_stmts in
+    
+    (* Add final assignments back to original variables *)
+    let final_stmts = add_final_assignments ctx multi_assigned ssa_stmts in
+    
+    if !debug then
+      Printf.eprintf "    SSA conversion complete: %d statements -> %d statements\n"
+        (List.length flat_stmts) (List.length final_stmts);
+    
+    final_stmts
+  end
+
+(* ============================================================================
    CONSTANT EXPRESSION EVALUATION
    ============================================================================ *)
 
@@ -590,7 +812,56 @@ let rec transform_stmt symtab stmt =
       }
   
   | Always { always; senses; stmts } ->
-      Always { always; senses; stmts = List.map (transform_stmt symtab) stmts }
+      (* Classify the always block *)
+      if !debug then
+        Printf.eprintf "  Processing Always block: %s\n" always;
+      
+      let is_combinational = match always with
+        | "always_comb" -> true
+        | "always_latch" -> false
+        | "always_ff" -> false
+        | "always" ->
+            (* Check sensitivity list *)
+            let has_edge = List.exists (function
+              | SenTree items ->
+                  List.exists (function
+                    | SenItem { edge_str; _ } ->
+                        if !debug then
+                          Printf.eprintf "    Edge string: %s\n" edge_str;
+                        String.contains edge_str 'p' || String.contains edge_str 'n' ||
+                        edge_str = "posedge" || edge_str = "negedge"
+                    | _ -> false
+                  ) items
+              | SenItem { edge_str; _ } ->
+                  if !debug then
+                    Printf.eprintf "    Edge string: %s\n" edge_str;
+                  String.contains edge_str 'p' || String.contains edge_str 'n' ||
+                  edge_str = "posedge" || edge_str = "negedge"
+              | _ -> false
+            ) senses in
+            if !debug then
+              Printf.eprintf "    Has edge: %b -> combinational: %b\n" has_edge (not has_edge);
+            not has_edge  (* If no edges, it's combinational *)
+        | _ -> false
+      in
+      
+      if is_combinational then begin
+        if !debug then
+          Printf.eprintf "  Converting combinational always block to SSA\n";
+        
+        (* Transform statements first (for loop unrolling, etc.) *)
+        let transformed = List.map (transform_stmt symtab) stmts in
+        
+        (* Then convert to SSA *)
+        let ssa_stmts = convert_to_ssa transformed in
+        
+        Always { always; senses; stmts = ssa_stmts }
+      end else begin
+        (* Sequential block - no SSA needed *)
+        if !debug then
+          Printf.eprintf "  Sequential block - no SSA conversion\n";
+        Always { always; senses; stmts = List.map (transform_stmt symtab) stmts }
+      end
   
   | _ -> stmt
 

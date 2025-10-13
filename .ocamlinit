@@ -4,10 +4,13 @@
 open Yojson;;
 open Sv_ast;;
 open Sv_parse;;
-open Sv_main;;
+open Sv_main_struct;;
 
 let _ = scan "results/";;
+(*
 let ast = Hashtbl.find asthash "Vcomprehensive_sv_testcase.tree.json";;
 let ast' = Hashtbl.find asthash "Variane_testharness.tree.json";;
 let ast'' = Hashtbl.find asthash "Vdebug_test.tree.json";;
 let ast3 = Hashtbl.find asthash "Varray_test.tree.json";;
+*)
+let ast = Hashtbl.find asthash "Venable_test.tree.json";;

@@ -291,6 +291,7 @@ interface data_if #(parameter int WIDTH = 8) (input logic clk, input logic rst_n
     
 endinterface
 
+/*
 // Simple testbench structure
 module testbench;
     logic clk = 0;
@@ -317,3 +318,4 @@ module testbench;
     // );
     
 endmodule
+*/

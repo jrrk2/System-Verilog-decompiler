@@ -13,6 +13,8 @@ json_to_verilog.dSYM/
 json_verilog_lexer.mll
 json_verilog
 json_verilog_top
+json_struct_top
+json_yosys_top
 obj_dir/
 old/
 results/

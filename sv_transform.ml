@@ -181,8 +181,39 @@ let add_final_assignments ctx multi_assigned stmts =
   ) multi_assigned in
   stmts @ finals
 
+(* Add variable declarations for SSA versioned names *)
+let add_ssa_declarations ctx multi_assigned original_vars =
+  List.concat_map (fun var_name ->
+    let version = get_version ctx var_name in
+    if version > 0 then begin
+      (* Find original variable to get its type *)
+      let original_var = List.find_opt (function
+        | Var { name = n; _ } when n = var_name -> true
+        | _ -> false
+      ) original_vars in
+      
+      match original_var with
+      | Some (Var { dtype_ref; dtype_name; _ }) ->
+          (* Create declarations for cnt_1, cnt_2, ..., cnt_N *)
+          List.init version (fun i ->
+            let versioned_name = Printf.sprintf "%s_%d" var_name (i + 1) in
+            Var {
+              name = versioned_name;
+              dtype_ref;
+              var_type = "VAR";
+              direction = "NONE";
+              value = None;
+              dtype_name;
+              is_param = false;
+            }
+          )
+      | _ -> []
+    end else
+      []
+  ) multi_assigned
+
 (* Convert to SSA form *)
-let convert_to_ssa stmts =
+let convert_to_ssa_with_decls original_vars stmts =
   if !debug then
     Printf.eprintf "  Converting to SSA form\n";
   
@@ -203,12 +234,19 @@ let convert_to_ssa stmts =
     let ssa_stmts = List.map (ssa_stmt ctx multi_assigned) flat_stmts in
     let final_stmts = add_final_assignments ctx multi_assigned ssa_stmts in
     
-    if !debug then
-      Printf.eprintf "    SSA conversion complete: %d statements -> %d statements\n"
-        (List.length flat_stmts) (List.length final_stmts);
+    (* Add variable declarations for SSA versions *)
+    let var_decls = add_ssa_declarations ctx multi_assigned original_vars in
     
-    final_stmts
+    if !debug then
+      Printf.eprintf "    SSA conversion complete: %d statements -> %d statements (+ %d var decls)\n"
+        (List.length flat_stmts) (List.length final_stmts) (List.length var_decls);
+    
+    var_decls @ final_stmts
   end
+
+(* Original convert_to_ssa without declarations (for when we don't have original_vars) *)
+let convert_to_ssa stmts =
+  convert_to_ssa_with_decls [] stmts
 
 (* ============================================================================
    CONSTANT EXPRESSION EVALUATION

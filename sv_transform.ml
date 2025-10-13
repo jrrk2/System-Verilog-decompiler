@@ -180,9 +180,17 @@ let rec substitute_var var_name value expr =
       }
   
   | ArraySel { expr; index } ->
+      let substituted_index = substitute_var var_name value index in
+      (* Simplify index if it's a Sel with just an expr and lsb=0 *)
+      let simplified_index = match substituted_index with
+        | Sel { expr = index_expr; lsb = Some (Const { name; _ }); width = None; _ }
+          when name = "0" || name = "32'h0" || name = "32'sh0" ->
+            index_expr  (* Just use the expr part, drop the [0] bit select *)
+        | _ -> substituted_index
+      in
       ArraySel {
         expr = substitute_var var_name value expr;
-        index = substitute_var var_name value index;
+        index = simplified_index;
       }
   
   | Concat { parts } ->

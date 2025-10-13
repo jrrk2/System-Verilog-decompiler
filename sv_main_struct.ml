@@ -35,8 +35,11 @@ let scan rslt =
       let ast = translate_tree_to_ast (obj^itm) in
       Hashtbl.add asthash itm ast;
       
+      (* 2. NEW: Transform non-synth to synth *)
+      let transformed_ast = Sv_transform.transform ~verbose:true ast in
+      
       (* Convert to structural with validation *)
-      let result, warn = Sv_gen_struct.generate_structural_with_warnings ast in
+      let result, warn = Sv_gen_struct.generate_structural_with_warnings transformed_ast in
       
       (* Print warnings *)
       if List.length warn > 0 then begin

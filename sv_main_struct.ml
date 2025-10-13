@@ -11,6 +11,7 @@ let translate_tree_to_ast json_file =
   Sv_parse.parse json
 
 let asthash = Hashtbl.create 255
+let tranhash = Hashtbl.create 255
 
 let scan rslt =
   let obj = "obj_dir/" in
@@ -37,6 +38,7 @@ let scan rslt =
       
       (* 2. NEW: Transform non-synth to synth *)
       let transformed_ast = Sv_transform.transform ~verbose:true ast in
+      Hashtbl.add tranhash itm transformed_ast;
       
       (* Convert to structural with validation *)
       let result, warn = Sv_gen_struct.generate_structural_with_warnings transformed_ast in

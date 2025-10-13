@@ -17,3 +17,4 @@ let ast'' = Hashtbl.find asthash "Vdebug_test.tree.json";;
 let ast3 = Hashtbl.find asthash "Varray_test.tree.json";;
 *)
 let ast = Hashtbl.find asthash "Vloop.tree.json";;
+let tran = Hashtbl.find tranhash "Vloop.tree.json";;

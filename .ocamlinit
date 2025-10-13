@@ -4,6 +4,7 @@
 open Yojson;;
 open Sv_ast;;
 open Sv_parse;;
+open Sv_transform;;
 open Sv_main_struct;;
 (*
 open Sv_main;;

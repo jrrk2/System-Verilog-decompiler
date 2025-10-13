@@ -181,9 +181,21 @@ let add_final_assignments ctx multi_assigned stmts =
   ) multi_assigned in
   stmts @ finals
 
+(* Collect SSA variable declarations that need to be added to module *)
+let ssa_var_decls = ref []
+
+let clear_ssa_var_decls () =
+  ssa_var_decls := []
+
+let add_ssa_var_decl var_decl =
+  ssa_var_decls := var_decl :: !ssa_var_decls
+
+let get_ssa_var_decls () =
+  List.rev !ssa_var_decls
+
 (* Add variable declarations for SSA versioned names *)
-let add_ssa_declarations ctx multi_assigned original_vars =
-  List.concat_map (fun var_name ->
+let collect_ssa_declarations ctx multi_assigned original_vars =
+  List.iter (fun var_name ->
     let version = get_version ctx var_name in
     if version > 0 then begin
       (* Find original variable to get its type *)
@@ -195,9 +207,9 @@ let add_ssa_declarations ctx multi_assigned original_vars =
       match original_var with
       | Some (Var { dtype_ref; dtype_name; _ }) ->
           (* Create declarations for cnt_1, cnt_2, ..., cnt_N *)
-          List.init version (fun i ->
-            let versioned_name = Printf.sprintf "%s_%d" var_name (i + 1) in
-            Var {
+          for i = 1 to version do
+            let versioned_name = Printf.sprintf "%s_%d" var_name i in
+            let var_decl = Var {
               name = versioned_name;
               dtype_ref;
               var_type = "VAR";
@@ -205,11 +217,13 @@ let add_ssa_declarations ctx multi_assigned original_vars =
               value = None;
               dtype_name;
               is_param = false;
-            }
-          )
-      | _ -> []
-    end else
-      []
+            } in
+            if !debug then
+              Printf.eprintf "    Creating var decl: %s\n" versioned_name;
+            add_ssa_var_decl var_decl
+          done
+      | _ -> ()
+    end
   ) multi_assigned
 
 (* Convert to SSA form *)
@@ -234,14 +248,14 @@ let convert_to_ssa_with_decls original_vars stmts =
     let ssa_stmts = List.map (ssa_stmt ctx multi_assigned) flat_stmts in
     let final_stmts = add_final_assignments ctx multi_assigned ssa_stmts in
     
-    (* Add variable declarations for SSA versions *)
-    let var_decls = add_ssa_declarations ctx multi_assigned original_vars in
+    (* Collect variable declarations for later insertion at module level *)
+    collect_ssa_declarations ctx multi_assigned original_vars;
     
     if !debug then
-      Printf.eprintf "    SSA conversion complete: %d statements -> %d statements (+ %d var decls)\n"
-        (List.length flat_stmts) (List.length final_stmts) (List.length var_decls);
+      Printf.eprintf "    SSA conversion complete: %d statements -> %d statements\n"
+        (List.length flat_stmts) (List.length final_stmts);
     
-    var_decls @ final_stmts
+    final_stmts
   end
 
 (* Original convert_to_ssa without declarations (for when we don't have original_vars) *)

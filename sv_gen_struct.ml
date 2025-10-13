@@ -237,6 +237,25 @@ let rec infer_width ctx = function
       List.fold_left (fun acc p -> acc + infer_width ctx p) 0 parts
   | _ -> 1
 
+(* Check if an expression depends on a variable (for loop detection) *)
+let rec expr_depends_on ctx var_name = function
+  | VarRef { name; _ } -> name = var_name
+  | BinaryOp { lhs; rhs; _ } -> 
+      expr_depends_on ctx var_name lhs || expr_depends_on ctx var_name rhs
+  | UnaryOp { operand; _ } -> 
+      expr_depends_on ctx var_name operand
+  | Cond { condition; then_val; else_val } ->
+      expr_depends_on ctx var_name condition ||
+      expr_depends_on ctx var_name then_val ||
+      expr_depends_on ctx var_name else_val
+  | Sel { expr; _ } | ArraySel { expr; _ } ->
+      expr_depends_on ctx var_name expr
+  | Concat { parts } ->
+      List.exists (expr_depends_on ctx var_name) parts
+  | Replicate { src; _ } ->
+      expr_depends_on ctx var_name src
+  | _ -> false
+
 let create_context () = {
   variables = Hashtbl.create 100;
   wires = ref [];
@@ -362,22 +381,48 @@ let gen_mux ctx sel in0 in1 result_wire width =
       width inst_name sel in0 in1 result_wire) :: !(ctx.instances);
   result_wire
 
-(* Generate enabled flip-flop *)
 let gen_dff_en ctx clk rst en d q width reset_val =
   let inst_name = gen_inst_name "dff" in
-  let rst_str = match rst with
-    | Some r -> Printf.sprintf ", .rst(%s)" r
-    | None -> ""
+  
+  (* Always include all ports, tie off if not used *)
+  let rst_port = match rst with
+    | Some r -> Printf.sprintf ".rst(%s)" r
+    | None -> ".rst(1'b0)"  (* Tie to 0 if no reset *)
   in
-  let en_str = match en with
-    | Some e -> Printf.sprintf ", .en(%s)" e
-    | None -> ""
+  
+  let en_port = match en with
+    | Some e -> Printf.sprintf ".en(%s)" e
+    | None -> ".en(1'b1)"   (* Always enabled if no enable *)
   in
+  
   ctx.instances := 
-    (Printf.sprintf "  dff_en #(.WIDTH(%d), .RESET_VAL(%d)) %s (.clk(%s)%s%s, .d(%s), .q(%s));" 
-      width reset_val inst_name clk rst_str en_str d q) :: !(ctx.instances);
+    (Printf.sprintf "  dff_en #(.WIDTH(%d), .RESET_VAL(%d)) %s (.clk(%s), %s, %s, .d(%s), .q(%s));" 
+      width reset_val inst_name clk rst_port en_port d q) :: !(ctx.instances);
   q
 
+
+(* Generate latch primitive *)
+let gen_latch_en ctx en d q width =
+  let inst_name = gen_inst_name "latch" in
+  
+  let en_port = match en with
+    | Some e -> Printf.sprintf ".en(%s)" e
+    | None -> ".en(1'b1)"
+  in
+  
+  ctx.instances := 
+    (Printf.sprintf "  latch_en #(.WIDTH(%d)) %s (%s, .d(%s), .q(%s));" 
+      width inst_name en_port d q) :: !(ctx.instances);
+  q
+
+(* Enhanced latch detection and handling *)
+let detect_latch_enable stmt =
+  match stmt with
+  | If { condition = VarRef { name; _ }; _ } -> Some name
+  | If { condition = UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ } }; _ } -> 
+      Some name  (* Active low enable *)
+  | _ -> None
+  
 (* Generate memory instance *)
 let gen_memory ctx addr_width data_width depth we clk addr din dout name =
   let inst_name = gen_inst_name "mem" in
@@ -385,7 +430,6 @@ let gen_memory ctx addr_width data_width depth we clk addr din dout name =
     (Printf.sprintf "  memory #(.ADDR_WIDTH(%d), .DATA_WIDTH(%d), .DEPTH(%d)) %s (.clk(%s), .we(%s), .addr(%s), .din(%s), .dout(%s));" 
       addr_width data_width depth inst_name clk we addr din dout) :: !(ctx.instances);
   dout
-
   
 (* Convert expression to structural form *)
 let rec structural_expr ctx expr =
@@ -597,11 +641,25 @@ and structural_if_as_mux ctx condition then_stmt else_stmt =
         ) else_assigns in
         rhs
       with Not_found ->
-        VarRef { name = lhs_name; access = "RD" }
+        (* NO ELSE BRANCH - different handling for sequential vs combinational *)
+        if ctx.in_sequential then
+          VarRef { name = lhs_name; access = "RD" }  (* OK in sequential - keeps value *)
+        else begin
+          (* In combinational, use default value to avoid loop *)
+          add_warning (Printf.sprintf "Incomplete if for %s - using default 0" lhs_name);
+          Const { name = "'0"; dtype_ref = None }
+        end
     in
     
     let then_wire = structural_expr ctx then_rhs in
     let else_wire = structural_expr ctx else_rhs in
+    (* Check for combinational loop in combinational context *)
+    if not ctx.in_sequential then begin
+      if expr_depends_on ctx lhs_name then_rhs then
+        failwith (Printf.sprintf "Combinational loop: %s depends on itself in then branch" lhs_name);
+      if expr_depends_on ctx lhs_name else_rhs then
+        failwith (Printf.sprintf "Combinational loop: %s depends on itself in else branch" lhs_name)
+    end;
     
     let result_wire = gen_inst_name "wire" in
     let width = match get_var ctx lhs_name with
@@ -617,51 +675,90 @@ and structural_if_as_mux ctx condition then_stmt else_stmt =
   in
   
   List.iter process_var then_assigns
-
-(* Convert case statement to cascaded muxes *)
 and structural_case ctx expr items =
   let expr_wire = structural_expr ctx expr in
   
-  (* Build cascaded comparator/mux tree *)
-  let rec build_case_tree items =
-    match items with
-    | [] -> ()
-    | item :: rest ->
-        (match item.conditions with
-        | [] -> (* default case *)
-            List.iter (fun stmt ->
-              match stmt with
-              | Assign { lhs; rhs; _ } ->
-                  structural_assign ctx lhs rhs ctx.in_sequential
-              | _ -> ()
-            ) item.statements
-        | cond :: _ ->
-            let cond_wire = structural_expr ctx cond in
-            let eq_wire = gen_inst_name "wire" in
-            ctx.wires := (Printf.sprintf "  logic %s;" eq_wire) :: !(ctx.wires);
-            let _ = gen_binary_op ctx "EQ" expr_wire cond_wire eq_wire 1 in
-            
-            (* Generate conditional assignment for this case *)
-            (* This is simplified - real implementation needs full mux tree *)
-            List.iter (fun stmt ->
-              match stmt with
-              | Assign { lhs; rhs; _ } ->
+  (* Collect all variables that are assigned *)
+  let assigned_vars = ref [] in
+  List.iter (fun item ->
+    List.iter (function
+      | Assign { lhs = VarRef { name; _ }; _ } ->
+          if not (List.mem name !assigned_vars) then
+            assigned_vars := name :: !assigned_vars
+      | _ -> ()
+    ) item.statements
+  ) items;
+  
+  (* For each assigned variable, build proper mux tree *)
+  List.iter (fun var_name ->
+    (* Get actual width from variable table *)
+    let width = match get_var ctx var_name with
+      | Some { width; _ } -> width
+      | None -> 
+          add_warning (Printf.sprintf "Cannot determine width for %s, using 32" var_name);
+          32
+    in
+    
+    (* Build cascaded mux chain for this variable *)
+    let rec build_mux_chain items default_val =
+      match items with
+      | [] -> default_val
+      | item :: rest ->
+          match item.conditions with
+          | [] -> (* default case *)
+              let case_val = List.find_map (function
+                | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = var_name -> Some rhs
+                | _ -> None
+              ) item.statements in
+              (match case_val with
+              | Some rhs -> structural_expr ctx rhs
+              | None -> default_val)
+          | cond :: _ ->
+              let cond_wire = structural_expr ctx cond in
+              let eq_wire = gen_inst_name "wire" in
+              ctx.wires := (Printf.sprintf "  logic %s;" eq_wire) :: !(ctx.wires);
+              let _ = gen_binary_op ctx "EQ" expr_wire cond_wire eq_wire 1 in
+              
+              (* Find value for this case *)
+              let case_val = List.find_map (function
+                | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = var_name -> Some rhs
+                | _ -> None
+              ) item.statements in
+              
+              match case_val with
+              | Some rhs ->
                   let rhs_wire = structural_expr ctx rhs in
-                  let lhs_name = match lhs with
-                    | VarRef { name; _ } -> name
-                    | _ -> structural_expr ctx lhs
-                  in
-                  let temp_wire = gen_inst_name "wire" in
-                  let width = 32 in
-                  ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (width-1) temp_wire) :: !(ctx.wires);
-                  let _ = gen_mux ctx eq_wire lhs_name rhs_wire temp_wire width in
-                  structural_assign ctx lhs (VarRef { name = temp_wire; access = "RD" }) ctx.in_sequential
-              | _ -> ()
-            ) item.statements;
-            
-            build_case_tree rest)
-  in
-  build_case_tree items
+                  let next_default = build_mux_chain rest default_val in
+                  let result_wire = gen_inst_name "wire" in
+                  ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (width-1) result_wire) :: !(ctx.wires);
+                  let _ = gen_mux ctx eq_wire next_default rhs_wire result_wire width in
+                  result_wire
+              | None ->
+                  build_mux_chain rest default_val
+    in
+    
+    (* Start with default value based on context *)
+    let default_wire = 
+      if ctx.in_sequential then begin
+        (* Sequential - can hold previous value *)
+        var_name
+      end else begin
+        (* Combinational - must use constant to avoid loop *)
+        let temp_wire = gen_inst_name "wire" in
+        ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (width-1) temp_wire) :: !(ctx.wires);
+        ctx.instances := (Printf.sprintf "  assign %s = %d'h0;" temp_wire width) :: !(ctx.instances);
+        temp_wire
+      end
+    in
+    
+    let final_wire = build_mux_chain items default_wire in
+    
+    (* Only add assignment if final_wire is different from var_name *)
+    if final_wire <> var_name then begin
+      ctx.instances := 
+        (Printf.sprintf "  assign %s = %s;" var_name final_wire) :: !(ctx.instances)
+    end
+  ) !assigned_vars
 
 (* Flatten loop into unrolled statements *)
 and flatten_loop ctx condition stmts incs max_iterations =
@@ -744,8 +841,9 @@ and structural_stmt ctx stmt =
           List.iter (structural_stmt ctx) stmts
       
       | Latch ->
-          add_warning "Latch detected - ensure this is intentional";
-          List.iter (structural_stmt ctx) stmts)
+	  add_warning "Converting always_latch block - ensure this is intentional";
+	  (* For latches, we're more permissive - just process them *)
+	  structural_latch ctx stmts)
     
   | Var { name; dtype_ref; dtype_name; var_type; _ } ->
       (match var_type with
@@ -768,10 +866,16 @@ and inline_task ctx task_def args =
 (* Validate that statements can be converted to hardware *)
 and validate_hardware_stmt ctx = function
   | Assign _ | AssignW _ -> true
+
   | If { condition; then_stmt; else_stmt } ->
-      validate_hardware_expr ctx condition &&
-      validate_hardware_stmt ctx then_stmt &&
-      (match else_stmt with Some s -> validate_hardware_stmt ctx s | None -> true)
+      let cond_valid = validate_hardware_expr ctx condition in
+      let then_valid = validate_hardware_stmt ctx then_stmt in
+      let else_valid = match else_stmt with 
+        | Some s -> validate_hardware_stmt ctx s 
+        | None -> true
+      in
+      cond_valid && then_valid && else_valid
+
   | Case { expr; items } ->
       validate_hardware_expr ctx expr &&
       List.for_all (fun { conditions; statements } ->
@@ -783,6 +887,14 @@ and validate_hardware_stmt ctx = function
   | EventCtrl _ | Delay _ | Initial _ | InitialStatic _ | Final _ -> false
   | Display _ | Finish | Stop _ -> false
   | _ -> true
+
+and has_assignments = function
+  | Assign _ | AssignW _ -> true
+  | Begin { stmts; _ } -> List.exists has_assignments stmts
+  | If { then_stmt; else_stmt; _ } ->
+      has_assignments then_stmt || 
+      (match else_stmt with Some s -> has_assignments s | None -> false)
+  | _ -> false
 
 and validate_hardware_expr ctx = function
   | VarRef _ | Const _ -> true
@@ -827,6 +939,47 @@ and validate_hardware_expr ctx = function
   
   | _ -> false
 
+(* Convert always_latch block to structural latches *)
+and structural_latch ctx stmts =
+  add_warning "Converting always_latch block - ensure this is intentional";
+  
+  (* Try to detect enable signal from first statement *)
+  let enable_sig = match stmts with
+    | If { condition; then_stmt; _ } :: _ ->
+        (match condition with
+        | VarRef { name; _ } -> Some name
+        | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ } } -> Some name
+        | _ -> None)
+    | _ -> None
+  in
+  
+  (* Extract assignments from latch body *)
+  let rec extract_latch_assigns = function
+    | If { then_stmt; _ } -> extract_latch_assigns then_stmt
+    | Assign { lhs; rhs; _ } -> [(lhs, rhs)]
+    | Begin { stmts; _ } ->
+        List.concat (List.map extract_latch_assigns stmts)
+    | _ -> []
+  in
+  
+  let assigns = List.concat (List.map extract_latch_assigns stmts) in
+  
+  (* Generate latch for each assignment *)
+  List.iter (fun (lhs, rhs) ->
+    let lhs_name = match lhs with
+      | VarRef { name; _ } -> name
+      | _ -> structural_expr ctx lhs
+    in
+    let rhs_wire = structural_expr ctx rhs in
+    let width = match get_var ctx lhs_name with
+      | Some { width; _ } -> width
+      | None -> infer_width ctx rhs
+    in
+    
+    let _ = gen_latch_en ctx enable_sig rhs_wire lhs_name width in
+    ()
+  ) assigns
+  
 (* Convert module to structural form - NOT part of mutual recursion *)
 let structural_module name stmts =
   add_warning (Printf.sprintf "Converting module '%s' to structural form" name);

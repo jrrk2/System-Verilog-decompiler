@@ -23,6 +23,112 @@ type structural_context = {
   mutable current_reset: string option;
 }
 
+(* Enhanced always block classification *)
+type always_block_type =
+  | Sequential of {
+      clock: string;
+      clock_edge: [`Posedge | `Negedge];
+      reset: (string * [`Async | `Sync]) option;
+    }
+  | Combinational
+  | Latch
+  | Unsynthesizable of string
+
+(* Detect edge type from sensitivity *)
+let detect_edge edge_str =
+  let lower = String.lowercase_ascii edge_str in
+  if String.contains lower 'p' || lower = "posedge" then `Posedge
+  else if String.contains lower 'n' || lower = "negedge" then `Negedge
+  else failwith ("Unknown edge type: " ^ edge_str)
+
+(* Detect clock signals *)
+let is_clock_signal name =
+  let lower = String.lowercase_ascii name in
+  lower = "clk" || lower = "clock" || String.contains lower 'c' && String.contains lower 'l' && String.contains lower 'k'
+
+(* Detect reset signals *)
+let is_reset_signal name =
+  let lower = String.lowercase_ascii name in
+  lower = "rst" || lower = "reset" || lower = "rstn" || lower = "rst_n"
+
+(* Enhanced sensitivity analysis *)
+let analyze_sensitivity_detailed senses =
+  let clocks = ref [] in
+  let resets = ref [] in
+  let other_signals = ref [] in
+  
+  let rec process_sense = function
+    | SenTree items ->
+        List.iter process_sense items
+    | SenItem { edge_str; signal } ->
+        (match signal with
+        | VarRef { name; _ } ->
+            let edge = detect_edge edge_str in
+            if is_clock_signal name then
+              clocks := (name, edge) :: !clocks
+            else if is_reset_signal name then
+              resets := (name, edge) :: !resets
+            else
+              other_signals := (name, edge) :: !other_signals
+        | _ -> ())
+    | _ -> ()
+  in
+  
+  List.iter process_sense senses;
+  (!clocks, !resets, !other_signals)
+
+(* Detect reset pattern from statements *)
+let rec detect_reset_pattern stmt =
+  let rec has_only_resets = function
+    | Assign { rhs = Const { name; _ }; _ } when name = "0" || name = "'0" || name = "1'b0" -> true
+    | Begin { stmts; _ } -> List.for_all has_only_resets stmts
+    | _ -> false
+  in
+  
+  match stmt with
+  | If { condition; then_stmt; _ } ->
+      (match condition with
+      | VarRef { name; _ } when is_reset_signal name ->
+          if has_only_resets then_stmt then Some (name, `Sync) else None
+      | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ } } when is_reset_signal name ->
+          if has_only_resets then_stmt then Some (name, `Sync) else None
+      | _ -> None)
+  | Begin { stmts; _ } ->
+      (match stmts with first :: _ -> detect_reset_pattern first | [] -> None)
+  | _ -> None
+
+(* Classify always block type - THIS IS THE KEY FUNCTION *)
+let classify_always_block always_type senses stmts =
+  match always_type with
+  | "always_comb" -> Combinational
+  | "always_latch" -> Latch
+  | "always_ff" ->
+      let (clocks, resets, _) = analyze_sensitivity_detailed senses in
+      (match clocks, resets with
+      | (clk, clk_edge) :: [], [] ->
+          Sequential { clock = clk; clock_edge = clk_edge; reset = None }
+      | (clk, clk_edge) :: [], (rst, _) :: [] ->
+          Sequential { clock = clk; clock_edge = clk_edge; reset = Some (rst, `Async) }
+      | _ -> Unsynthesizable "always_ff must have exactly one clock")
+  | "always" ->
+      let (clocks, resets, others) = analyze_sensitivity_detailed senses in
+      if List.length clocks > 0 then
+        (match clocks, resets with
+        | (clk, clk_edge) :: [], [] ->
+            (* Check for sync reset in body *)
+            let sync_reset = detect_reset_pattern (Begin { name = ""; stmts; is_generate = false }) in
+            Sequential { clock = clk; clock_edge = clk_edge; reset = sync_reset }
+        | (clk, clk_edge) :: [], (rst, _) :: [] ->
+            Sequential { clock = clk; clock_edge = clk_edge; reset = Some (rst, `Async) }
+        | _ :: _ :: _, _ -> Unsynthesizable "Multiple clocks not supported"
+        | _, _ :: _ :: _ -> Unsynthesizable "Multiple resets not supported"
+        | _ -> Unsynthesizable "Invalid clock configuration")
+      else if List.length others > 0 || List.length senses = 0 then
+        Combinational
+      else
+        Unsynthesizable "Invalid sensitivity list"
+  | _ -> Unsynthesizable ("Unknown always type: " ^ always_type)
+
 (* Generate unique instance names *)
 let gen_inst_name prefix =
   incr inst_counter;
@@ -102,16 +208,6 @@ let add_var ctx name dtype_ref dtype_name is_reg =
 let get_var ctx name =
   try Some (Hashtbl.find ctx.variables name)
   with Not_found -> None
-
-(* Detect clock signals *)
-let is_clock_signal name =
-  let lower = String.lowercase_ascii name in
-  lower = "clk" || lower = "clock" || String.contains lower 'c' && String.contains lower 'l' && String.contains lower 'k'
-
-(* Detect reset signals *)
-let is_reset_signal name =
-  let lower = String.lowercase_ascii name in
-  lower = "rst" || lower = "reset" || lower = "rstn" || lower = "rst_n"
 
 (* Infer width from expression *)
 let rec infer_width ctx = function
@@ -290,6 +386,7 @@ let gen_memory ctx addr_width data_width depth we clk addr din dout name =
       addr_width data_width depth inst_name clk we addr din dout) :: !(ctx.instances);
   dout
 
+  
 (* Convert expression to structural form *)
 let rec structural_expr ctx expr =
   match expr with
@@ -609,24 +706,47 @@ and structural_stmt ctx stmt =
   
   | Begin { stmts; _ } ->
       List.iter (structural_stmt ctx) stmts
-  
+
   | Always { always; senses; stmts } ->
-      let (is_sequential, clock, reset) = analyze_sensitivity senses in
-      let old_sequential = ctx.in_sequential in
-      let old_clock = ctx.current_clock in
-      let old_reset = ctx.current_reset in
+      (* NEW: Classify the block first *)
+      let block_type = classify_always_block always senses stmts in
       
-      ctx.in_sequential <- is_sequential;
-      ctx.current_clock <- clock;
-      ctx.current_reset <- reset;
+      (match block_type with
+      | Unsynthesizable reason ->
+          add_warning ("ERROR: Unsynthesizable always block: " ^ reason);
+          failwith ("Cannot convert to structural: " ^ reason)
       
-      (* Process statements in sequential context *)
-      List.iter (structural_stmt ctx) stmts;
+      | Sequential { clock; clock_edge; reset } ->
+          (* Validate statements *)
+          if not (List.for_all (validate_hardware_stmt ctx) stmts) then
+            failwith "Sequential block contains unsynthesizable statements";
+          
+          (* Set context *)
+          let old_sequential = ctx.in_sequential in
+          let old_clock = ctx.current_clock in
+          let old_reset = ctx.current_reset in
+          
+          ctx.in_sequential <- true;
+          ctx.current_clock <- Some clock;
+          ctx.current_reset <- (match reset with Some (r, _) -> Some r | None -> None);
+          
+          (* Convert statements *)
+          List.iter (structural_stmt ctx) stmts;
+          
+          (* Restore context *)
+          ctx.in_sequential <- old_sequential;
+          ctx.current_clock <- old_clock;
+          ctx.current_reset <- old_reset
       
-      ctx.in_sequential <- old_sequential;
-      ctx.current_clock <- old_clock;
-      ctx.current_reset <- old_reset
-  
+      | Combinational ->
+          if not (List.for_all (validate_hardware_stmt ctx) stmts) then
+            failwith "Combinational block contains unsynthesizable statements";
+          List.iter (structural_stmt ctx) stmts
+      
+      | Latch ->
+          add_warning "Latch detected - ensure this is intentional";
+          List.iter (structural_stmt ctx) stmts)
+    
   | Var { name; dtype_ref; dtype_name; var_type; _ } ->
       (match var_type with
       | "PORT" | "VAR" ->
@@ -644,6 +764,68 @@ and inline_function ctx func_def args =
 and inline_task ctx task_def args =
   add_warning (Printf.sprintf "Inlining task (not yet implemented)");
   []
+ 
+(* Validate that statements can be converted to hardware *)
+and validate_hardware_stmt ctx = function
+  | Assign _ | AssignW _ -> true
+  | If { condition; then_stmt; else_stmt } ->
+      validate_hardware_expr ctx condition &&
+      validate_hardware_stmt ctx then_stmt &&
+      (match else_stmt with Some s -> validate_hardware_stmt ctx s | None -> true)
+  | Case { expr; items } ->
+      validate_hardware_expr ctx expr &&
+      List.for_all (fun { conditions; statements } ->
+        List.for_all (validate_hardware_expr ctx) conditions &&
+        List.for_all (validate_hardware_stmt ctx) statements
+      ) items
+  | Begin { stmts; _ } -> List.for_all (validate_hardware_stmt ctx) stmts
+  | While _ -> false  (* Not synthesizable *)
+  | EventCtrl _ | Delay _ | Initial _ | InitialStatic _ | Final _ -> false
+  | Display _ | Finish | Stop _ -> false
+  | _ -> true
+
+and validate_hardware_expr ctx = function
+  | VarRef _ | Const _ -> true
+  | BinaryOp { lhs; rhs; _ } -> validate_hardware_expr ctx lhs && validate_hardware_expr ctx rhs
+  | UnaryOp { operand; _ } -> validate_hardware_expr ctx operand
+  | Cond { condition; then_val; else_val } ->
+      validate_hardware_expr ctx condition &&
+      validate_hardware_expr ctx then_val &&
+      validate_hardware_expr ctx else_val
+  | Sel { expr; lsb; width; _ } ->
+      validate_hardware_expr ctx expr &&
+      (match lsb with Some e -> validate_hardware_expr ctx e | None -> true) &&
+      (match width with Some e -> validate_hardware_expr ctx e | None -> true)
+  | ArraySel { expr; index } -> validate_hardware_expr ctx expr && validate_hardware_expr ctx index
+  | Concat { parts } -> List.for_all (validate_hardware_expr ctx) parts
+  | FuncRef { name; args } when name = "clog2" -> List.for_all (validate_hardware_expr ctx) args
+  | FuncRef _ -> false  (* Most functions not synthesizable *)
+
+  | Assign { lhs; rhs; is_blocking = _ } ->
+      structural_assign ctx lhs rhs ctx.in_sequential; true
+  
+  | AssignW { lhs; rhs } ->
+      structural_assign ctx lhs rhs false; true
+  
+  | If { condition; then_stmt; else_stmt } ->
+      structural_if ctx condition then_stmt else_stmt; true
+  
+  | Case { expr; items } ->
+      structural_case ctx expr items; true
+  
+  | While { condition; stmts; incs } ->
+      flatten_loop ctx condition stmts incs 64; true
+  
+  | Begin { stmts; _ } ->
+      List.iter (structural_stmt ctx) stmts; true
+  
+  | Var { name; dtype_ref; dtype_name; var_type; _ } ->
+      (match var_type with
+      | "PORT" | "VAR" ->
+          add_var ctx name dtype_ref dtype_name false
+      | _ -> ()); true
+  
+  | _ -> false
 
 (* Convert module to structural form - NOT part of mutual recursion *)
 let structural_module name stmts =

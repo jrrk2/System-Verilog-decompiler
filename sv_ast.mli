@@ -69,7 +69,7 @@ and sv_node =
     }
   | Var' of {
       name: string;
-      dtype_ref: string;
+      dtype: string;
       var_type: string;
       direction: string;
       value: sv_node option;
@@ -87,7 +87,7 @@ and sv_node =
     }
   | Const' of {
       name: string;
-      dtype_ref: string;
+      dtype: string;
     }
   | Const of {
       name: string;
@@ -95,7 +95,7 @@ and sv_node =
     }
   | Typedef' of {
       name: string;
-      dtype_ref: string;
+      dtype: string;
     }
   | Typedef of {
       name: string;
@@ -103,7 +103,7 @@ and sv_node =
     }
   | Func' of {
       name: string;
-      dtype_ref: string;
+      dtype: string;
       stmts: sv_node list;
       vars: sv_node list;
     }
@@ -115,7 +115,7 @@ and sv_node =
     }
   | Task' of {
       name: string;
-      dtype_ref: string;
+      dtype: string;
       stmts: sv_node list;
       vars: sv_node list;
     }
@@ -214,14 +214,27 @@ and sv_node =
       name: string;
       args: sv_node list;
     }
+  | BinaryOp' of {
+      op: string;
+      lhs: sv_node;
+      rhs: sv_node;
+      dtype: string;
+    }
   | BinaryOp of {
       op: string;
       lhs: sv_node;
       rhs: sv_node;
+      dtype_ref: sv_type option;
+    }
+  | UnaryOp' of {
+      op: string;
+      operand: sv_node;
+      dtype: string;
     }
   | UnaryOp of {
       op: string;
       operand: sv_node;
+      dtype_ref: sv_type option;
     }
   | Concat of {
       parts: sv_node list;

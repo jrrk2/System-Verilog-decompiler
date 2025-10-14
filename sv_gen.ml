@@ -163,10 +163,10 @@ let fix_varxref_in_node top_level_ports iface_var_name node =
         VarRef { name = signal_name; access = "RD"; dtype_ref = None }
     | Assign { lhs; rhs; is_blocking } ->
         Assign { lhs = fix_node lhs; rhs = fix_node rhs; is_blocking }
-    | BinaryOp { op; lhs; rhs } ->
-        BinaryOp { op; lhs = fix_node lhs; rhs = fix_node rhs }
-    | UnaryOp { op; operand } ->
-        UnaryOp { op; operand = fix_node operand }
+    | BinaryOp { op; lhs; rhs; dtype_ref } ->
+        BinaryOp { op; lhs = fix_node lhs; rhs = fix_node rhs; dtype_ref }
+    | UnaryOp { op; operand; dtype_ref } ->
+        UnaryOp { op; operand = fix_node operand; dtype_ref }
     | Always { always; senses; stmts } ->
         let fixed_senses = List.map fix_node senses in
         let fixed_stmts = List.map fix_node stmts in
@@ -390,7 +390,7 @@ let rec generate_sv node indent =
   | SenItem { edge_str; signal; _ } ->
       Printf.sprintf "%s %s" edge_str (generate_sv_with_interfaces signal 0 [] |> String.trim)
 
-  | BinaryOp { op; lhs; rhs; _ } ->
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
       let op_str = binary_op_to_string op in
       Printf.sprintf "(%s %s %s)" 
         (generate_sv_with_interfaces lhs 0 [] |> String.trim) op_str (generate_sv_with_interfaces rhs 0 [] |> String.trim)

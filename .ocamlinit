@@ -11,8 +11,12 @@ open Sv_main;;
 *)
 
 let _ = scan "results/";;
+(*
 let ast = Hashtbl.find asthash "Vpackage_test.tree.json";;
 let tran = Hashtbl.find tranhash "Vpackage_test.tree.json";;
+*)
+let ast = Hashtbl.find asthash "Vsigned_mult.tree.json";;
+let tran = Hashtbl.find tranhash "Vsigned_mult.tree.json";;
 (*
 let ast = Hashtbl.find asthash "Vloop.tree.json";;
 let tran = Hashtbl.find tranhash "Vloop.tree.json";;

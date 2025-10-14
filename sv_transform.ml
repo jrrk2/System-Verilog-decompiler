@@ -111,10 +111,10 @@ let rec ssa_expr ctx expr =
   | VarRef { name; access = "RD"; dtype_ref } ->
       VarRef { name = get_versioned_name ctx name; access = "RD"; dtype_ref }
   | VarRef _ as v -> v
-  | BinaryOp { op; lhs; rhs } ->
-      BinaryOp { op; lhs = ssa_expr ctx lhs; rhs = ssa_expr ctx rhs }
-  | UnaryOp { op; operand } ->
-      UnaryOp { op; operand = ssa_expr ctx operand }
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
+      BinaryOp { op; lhs = ssa_expr ctx lhs; rhs = ssa_expr ctx rhs; dtype_ref }
+  | UnaryOp { op; operand; dtype_ref } ->
+      UnaryOp { op; operand = ssa_expr ctx operand; dtype_ref }
   | Cond { condition; then_val; else_val } ->
       Cond {
         condition = ssa_expr ctx condition;
@@ -227,7 +227,7 @@ let rec try_eval_const expr =
           | _ -> Some (int_of_string name)
         else Some (int_of_string name)
       with _ -> None)
-  | BinaryOp { op; lhs; rhs } ->
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
       (match try_eval_const lhs, try_eval_const rhs with
       | Some l, Some r ->
           (match op with
@@ -243,10 +243,10 @@ let rec substitute_var var_name value expr =
   match expr with
   | VarRef { name; access; dtype_ref } when name = var_name ->
       Const { name = string_of_int value; dtype_ref = None }
-  | BinaryOp { op; lhs; rhs } ->
-      BinaryOp { op; lhs = substitute_var var_name value lhs; rhs = substitute_var var_name value rhs }
-  | UnaryOp { op; operand } ->
-      UnaryOp { op; operand = substitute_var var_name value operand }
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
+      BinaryOp { op; lhs = substitute_var var_name value lhs; rhs = substitute_var var_name value rhs; dtype_ref }
+  | UnaryOp { op; operand; dtype_ref } ->
+      UnaryOp { op; operand = substitute_var var_name value operand; dtype_ref }
   | Cond { condition; then_val; else_val } ->
       Cond {
         condition = substitute_var var_name value condition;
@@ -298,7 +298,7 @@ let unroll_for_loop for_node =
       let start_val = try_eval_const rhs in
       
       let inc_amount = match incs with
-        | [Assign { rhs = BinaryOp { op = "ADD"; lhs; rhs }; _ }] ->
+        | [Assign { rhs = BinaryOp { op = "ADD"; lhs; rhs; dtype_ref }; _ }] ->
             (match try_eval_const lhs, try_eval_const rhs with
             | Some n, _ when n > 0 -> Some n
             | _, Some n when n > 0 -> Some n
@@ -308,7 +308,7 @@ let unroll_for_loop for_node =
       
       (* FIXED: Handle both directions of comparison *)
       let (bound_val, comparison_op) = match condition with
-        | BinaryOp { op; lhs; rhs } ->
+        | BinaryOp { op; lhs; rhs; dtype_ref } ->
             let lhs_c = try_eval_const lhs in
             let rhs_c = try_eval_const rhs in
             (match op, lhs_c, rhs_c with
@@ -427,10 +427,10 @@ let rec transform_stmt symtab stmt =
 
 and transform_expr symtab expr =
   match expr with
-  | BinaryOp { op; lhs; rhs } ->
-      BinaryOp { op; lhs = transform_expr symtab lhs; rhs = transform_expr symtab rhs }
-  | UnaryOp { op; operand } ->
-      UnaryOp { op; operand = transform_expr symtab operand }
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
+      BinaryOp { op; lhs = transform_expr symtab lhs; rhs = transform_expr symtab rhs; dtype_ref }
+  | UnaryOp { op; operand; dtype_ref } ->
+      UnaryOp { op; operand = transform_expr symtab operand; dtype_ref }
   | Cond { condition; then_val; else_val } ->
       Cond {
         condition = transform_expr symtab condition;

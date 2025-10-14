@@ -208,7 +208,7 @@ let rec parse_json attr json =
       let dtype_name = json |> member "dtypeName" |> to_string_option |> Option.value ~default:"logic" in
       let var_type = json |> member "varType" |> to_string_option |> Option.value ~default:"VAR" in
       let direction = json |> member "direction" |> to_string_option |> Option.value ~default:"NONE" in
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       let is_param = json |> member "isParam" |> to_bool_option |> Option.value ~default:false in
       let value = 
 	try 
@@ -224,8 +224,8 @@ let rec parse_json attr json =
 	  | [] -> None
 	with _ -> None
       in
-      let v = Var' { name; dtype_ref; var_type; direction; value; dtype_name; is_param } in
-      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype_ref;addr];
+      let v = Var' { name; dtype; var_type; direction; value; dtype_name; is_param } in
+      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype;addr];
       v            
 									    
   | "INITITEM" ->
@@ -233,24 +233,24 @@ let rec parse_json attr json =
       InitItem { value }
 									    
   | "CONST" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Const' { name; dtype_ref }
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      Const' { name; dtype }
       
   | "TYPEDEF" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      Typedef' { name; dtype_ref }
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      Typedef' { name; dtype }
       
   | "FUNC" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
-      Func' { name; dtype_ref; stmts; vars }
+      Func' { name; dtype; stmts; vars }
       
   | "TASK" ->
-      let dtype_ref = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
-      Task' { name; dtype_ref; stmts; vars }
+      Task' { name; dtype; stmts; vars }
       
   | "ALWAYS" ->
       let always = json |> member "keyword" |> to_string_option |> Option.value ~default:"always" in
@@ -384,13 +384,15 @@ let rec parse_json attr json =
   | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "POWSU" | "SHIFTL" | "SHIFTR" | "SHIFTRS" ->
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
-      BinaryOp { op = node_type; lhs; rhs }
+      let dtype = json |> member "dtypep" |> to_string in
+      BinaryOp' { op = node_type; lhs; rhs; dtype }
       
   (* Unary operators *)
   | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" | "LOGNOT" | "ONEHOT" | "ONEHOT0" | "NEGATE"
   | "EXTENDS" | "ISUNKNOWN" | "CLOG2" ->
       let operand = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      UnaryOp { op = node_type; operand }
+      let dtype = json |> member "dtypep" |> to_string in
+      UnaryOp' { op = node_type; operand; dtype }
   | "EVENTCONTROL" ->
       let sense = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
@@ -545,8 +547,8 @@ let othrwtyp = ref None
 let rec rw attr = function
 | Netlist lst -> Netlist (rwlst attr lst)
 | Module {name; stmts} -> Module {name; stmts=rwlst attr stmts}
-| Var' {name; dtype_ref; var_type; direction; value; dtype_name; is_param} ->
-  let dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) in
+| Var' {name; dtype; var_type; direction; value; dtype_name; is_param} ->
+  let dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) in
   Var {name; dtype_ref; var_type; direction; value; dtype_name; is_param}
 | Cell' {name; modp_addr; pins } ->
   Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=rwlst attr pins}
@@ -558,13 +560,17 @@ let rec rw attr = function
 | Always {always; senses; stmts} -> Always {always; senses=rwlst attr senses; stmts=rwlst attr stmts};
 | SenTree lst -> SenTree (rwlst attr lst)
 | SenItem {edge_str; signal} -> SenItem {edge_str; signal=rw attr signal}
-| BinaryOp {op; lhs; rhs} -> BinaryOp {op; lhs=rw attr lhs; rhs=rw attr rhs}
+| BinaryOp' {op; lhs; rhs; dtype} ->
+    BinaryOp {op;
+    lhs=rw attr lhs;
+    rhs=rw attr rhs;
+    dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
 | Interface {name; params; stmts} ->
   Interface {name; params=rwlst attr params; stmts=rwlst attr stmts}
 | Modport { name; vars } -> Modport { name; vars=rwlst attr vars }
 | ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
-| Const' { name; dtype_ref } ->
-  Const { name; dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
+| Const' { name; dtype } ->
+  Const { name; dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
 | Begin { name; stmts; is_generate } -> Begin { name; stmts=rwlst attr stmts; is_generate }
 | Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
 | Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
@@ -578,7 +584,8 @@ let rec rw attr = function
 | For' { condition; stmts; incs} -> For' {condition = rw attr condition;
 stmts = rwlst attr stmts;
 incs = rwlst attr incs;}
-| UnaryOp {op; operand} -> UnaryOp { op; operand = rw attr operand; }
+| UnaryOp' {op; operand; dtype } -> UnaryOp { op; operand = rw attr operand;
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype)}
 | Cond {condition; then_val; else_val } -> Cond {condition = rw attr condition;
     then_val = rw attr then_val;
     else_val = rw attr else_val} 
@@ -599,8 +606,8 @@ incs = rwlst attr incs;}
 | Cexpr { dtype; expr } -> Cexpr { dtype; expr = rwlst attr expr }
 | StmtExpr { expr } -> StmtExpr { expr = rw attr expr }
 | Package { name; stmts } -> Package { name; stmts = rwlst attr stmts }
-| Typedef' { name; dtype_ref } -> Typedef { name;
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
+| Typedef' { name; dtype } -> Typedef { name;
+    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
 | Typedef { name; dtype_ref } -> Typedef { name; dtype_ref } 
 | VarRef' { name; access; dtype } -> VarRef {
     name; access; dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
@@ -630,9 +637,9 @@ incs = rwlst attr incs;}
     search = rwlst attr search;
  }
 | TestPlusArgs _ as v -> v
-| Func' { name; dtype_ref; stmts; vars } -> Func {
+| Func' { name; dtype; stmts; vars } -> Func {
       name;
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
       stmts = rwlst attr stmts ;
       vars = rwlst attr vars }
 | Func {
@@ -653,9 +660,9 @@ incs = rwlst attr incs;}
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
       src = rw attr src ;
       count = rw attr count }
-| Task' { name; dtype_ref; stmts; vars } -> Task {
+| Task' { name; dtype; stmts; vars } -> Task {
       name;
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
+      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
       stmts = rwlst attr stmts ;
       vars = rwlst attr vars }
 | Task {
@@ -690,6 +697,8 @@ incs = rwlst attr incs;}
 | Replicate _
 | CMethodHard _
 | VarRef _
+| UnaryOp _
+| BinaryOp _
 | For _
 | Var _ as skip -> skip
 | Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"

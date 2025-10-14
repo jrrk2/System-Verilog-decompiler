@@ -461,13 +461,285 @@ let transform_module stmts =
       (Hashtbl.length symtab.tasks);
   
   List.map (transform_stmt symtab) stmts
+(* ============================================================================
+   FUNCTION AND TASK INLINING - Add to sv_transform.ml
+   ============================================================================ *)
 
+(* Substitute variable in expression - you already have this *)
+(* Just making sure it handles all cases *)
+
+(* Inline a function call by substituting parameters and returning the body *)
+let rec inline_function symtab func_name args =
+  match Hashtbl.find_opt symtab.functions func_name with
+  | Some (Func { stmts; vars; _ }) ->
+      if !debug then
+        Printf.eprintf "  Inlining function: %s\n" func_name;
+      
+      (* Extract input parameters in order *)
+      let params = List.filter_map (function
+        | Var { name; var_type = "PORT"; direction = "INPUT"; _ } -> Some name
+        | _ -> None
+      ) stmts in
+      
+      (* Find the return value assignment (assign to function name) *)
+      let return_expr = List.find_map (function
+        | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = func_name -> Some rhs
+        | _ -> None
+      ) stmts in
+      
+      (match return_expr with
+      | Some expr ->
+          (* Substitute each parameter with its argument *)
+          let substituted = List.fold_left2 
+            (fun acc_expr param arg ->
+              (* First evaluate the argument expression *)
+              let arg_expr = transform_expr symtab arg in
+              (* Then substitute the parameter name with the argument *)
+              substitute_var_expr param arg_expr acc_expr
+            ) expr params args
+          in
+          stats.functions_inlined <- stats.functions_inlined + 1;
+          Some substituted
+      | None ->
+          Printf.eprintf "Could not find return statement in function %s" func_name;
+          None)
+  | Some _ ->
+      if !debug then
+        Printf.eprintf "  Function %s symbol table incorrect, internal error\n" func_name;
+      None
+  | None ->
+      if !debug then
+        Printf.eprintf "  Function %s not found in symbol table\n" func_name;
+      None
+
+(* Substitute variable in expression - enhanced version *)
+and substitute_var_expr var_name replacement expr =
+  match expr with
+  | VarRef { name; access; dtype_ref } when name = var_name ->
+      replacement
+  | VarRef _ as v -> v
+  | Const _ as c -> c
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
+      BinaryOp { 
+        op; 
+        lhs = substitute_var_expr var_name replacement lhs; 
+        rhs = substitute_var_expr var_name replacement rhs;
+        dtype_ref 
+      }
+  | UnaryOp { op; operand; dtype_ref } ->
+      UnaryOp { 
+        op; 
+        operand = substitute_var_expr var_name replacement operand;
+        dtype_ref 
+      }
+  | Cond { condition; then_val; else_val } ->
+      Cond {
+        condition = substitute_var_expr var_name replacement condition;
+        then_val = substitute_var_expr var_name replacement then_val;
+        else_val = substitute_var_expr var_name replacement else_val;
+      }
+  | Sel { expr; lsb; width; range } ->
+      Sel {
+        expr = substitute_var_expr var_name replacement expr;
+        lsb = Option.map (substitute_var_expr var_name replacement) lsb;
+        width = Option.map (substitute_var_expr var_name replacement) width;
+        range;
+      }
+  | ArraySel { expr; index } ->
+      ArraySel {
+        expr = substitute_var_expr var_name replacement expr;
+        index = substitute_var_expr var_name replacement index;
+      }
+  | Concat { parts } ->
+      Concat { parts = List.map (substitute_var_expr var_name replacement) parts }
+  | Replicate { src; count; dtype_ref } ->
+      Replicate {
+        src = substitute_var_expr var_name replacement src;
+        count = substitute_var_expr var_name replacement count;
+        dtype_ref;
+      }
+  | other -> other
+
+(* Inline a task call - tasks can have output parameters *)
+let inline_task symtab task_name args =
+  match Hashtbl.find_opt symtab.tasks task_name with
+  | Some (Task { stmts; _ }) ->
+      if !debug then
+        Printf.eprintf "  Inlining task: %s\n" task_name;
+      
+      (* Extract parameters with their directions *)
+      let params = List.filter_map (function
+        | Var { name; var_type = "PORT"; direction; _ } -> Some (name, direction)
+        | _ -> None
+      ) stmts in
+      
+      (* Find assignments in the task body *)
+      let task_assigns = List.filter_map (function
+        | Assign { lhs; rhs; is_blocking } -> Some (lhs, rhs, is_blocking)
+        | _ -> None
+      ) stmts in
+      
+      (* Create substitution: for each input param, substitute with arg *)
+      let param_map = List.combine params args in
+      
+      (* Generate new assignments with substituted values *)
+      let new_stmts = List.map (fun (lhs, rhs, is_blocking) ->
+        (* Substitute input parameters in RHS *)
+        let substituted_rhs = List.fold_left 
+          (fun acc_expr ((param_name, direction), arg) ->
+            if direction = "INPUT" then
+              substitute_var_expr param_name arg acc_expr
+            else
+              acc_expr
+          ) rhs param_map
+        in
+        
+        (* For output parameters, substitute the LHS with the output argument *)
+        let substituted_lhs = match lhs with
+          | VarRef { name; _ } ->
+              (match List.find_opt (fun ((pname, dir), _) -> pname = name && dir = "OUTPUT") param_map with
+              | Some (_, out_arg) -> out_arg
+              | None -> lhs)
+          | _ -> lhs
+        in
+        
+        Assign { lhs = substituted_lhs; rhs = substituted_rhs; is_blocking }
+      ) task_assigns in
+      
+      stats.tasks_inlined <- stats.tasks_inlined + 1;
+      Some new_stmts
+  | Some _ ->
+      if !debug then
+        Printf.eprintf "  Task %s symbol table incorrect, internal error\n" task_name;
+      None
+  | None ->
+      if !debug then
+        Printf.eprintf "  Task %s not found in symbol table\n" task_name;
+      None
+
+(* Update transform_expr to inline function calls *)
+let rec transform_expr symtab expr =
+  match expr with
+  | FuncRef { name; args } ->
+      (match inline_function symtab name args with
+      | Some inlined_expr -> transform_expr symtab inlined_expr
+      | None -> 
+          (* Keep as FuncRef if inlining failed *)
+          FuncRef { name; args = List.map (transform_expr symtab) args })
+  
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
+      BinaryOp { op; lhs = transform_expr symtab lhs; rhs = transform_expr symtab rhs; dtype_ref }
+  
+  | UnaryOp { op; operand; dtype_ref } ->
+      UnaryOp { op; operand = transform_expr symtab operand; dtype_ref }
+  
+  | Cond { condition; then_val; else_val } ->
+      Cond {
+        condition = transform_expr symtab condition;
+        then_val = transform_expr symtab then_val;
+        else_val = transform_expr symtab else_val;
+      }
+  
+  | Sel { expr; lsb; width; range } ->
+      Sel {
+        expr = transform_expr symtab expr;
+        lsb = Option.map (transform_expr symtab) lsb;
+        width = Option.map (transform_expr symtab) width;
+        range;
+      }
+  
+  | ArraySel { expr; index } ->
+      ArraySel { expr = transform_expr symtab expr; index = transform_expr symtab index }
+  
+  | Concat { parts } ->
+      Concat { parts = List.map (transform_expr symtab) parts }
+  
+  | Replicate { src; count; dtype_ref } ->
+      Replicate { src = transform_expr symtab src; count = transform_expr symtab count; dtype_ref }
+  
+  | _ -> expr
+
+(* Update transform_stmt to inline task calls *)
+let rec transform_stmt symtab stmt =
+  match stmt with
+  | StmtExpr { expr = TaskRef { name; args } } ->
+      (match inline_task symtab name args with
+      | Some inlined_stmts -> Begin { name = ""; stmts = inlined_stmts; is_generate = false }
+      | None -> StmtExpr { expr = TaskRef { name; args } })
+  
+  | Assign { lhs; rhs; is_blocking } ->
+      Assign { lhs; rhs = transform_expr symtab rhs; is_blocking }
+  
+  | AssignW { lhs; rhs } ->
+      AssignW { lhs; rhs = transform_expr symtab rhs }
+  
+  | Initial { suspend; stmts } ->
+      Initial { suspend; stmts = List.map (transform_stmt symtab) stmts }
+  
+  | Always { always; senses; stmts } ->
+      if !debug then Printf.eprintf "  Processing Always block: %s\n" always;
+      
+      let transformed = List.map (transform_stmt symtab) stmts in
+      let (ssa_stmts, ssa_vars) = convert_to_ssa transformed in
+      
+      Always { always; senses; stmts = ssa_vars @ ssa_stmts }
+  
+  | Begin { name; stmts; is_generate } ->
+      Begin { name; stmts = List.map (transform_stmt symtab) stmts; is_generate }
+  
+  | For _ as for_node ->
+      (match unroll_for_loop for_node with
+      | Some unrolled -> Begin { name = ""; stmts = unrolled; is_generate = false }
+      | None -> for_node)
+  
+  | If { condition; then_stmt; else_stmt } ->
+      If {
+        condition = transform_expr symtab condition;
+        then_stmt = transform_stmt symtab then_stmt;
+        else_stmt = Option.map (transform_stmt symtab) else_stmt;
+      }
+  
+  | _ -> stmt
+
+(* Update collect_functions_tasks to handle packages *)
+let rec collect_functions_tasks symtab node =
+  match node with
+  | Func { name; _ } as f -> 
+      Hashtbl.replace symtab.functions name f
+  | Task { name; _ } as t -> 
+      Hashtbl.replace symtab.tasks name t
+  | Package { stmts; _ } ->
+      List.iter (collect_functions_tasks symtab) stmts
+  | Module { stmts; _ } ->
+      List.iter (collect_functions_tasks symtab) stmts
+  | Begin { stmts; _ } | Always { stmts; _ } | Initial { stmts; _ } ->
+      List.iter (collect_functions_tasks symtab) stmts
+  | _ -> ()
+
+(* Update transform_ast to collect from packages *)
 let rec transform_ast node =
   match node with
-  | Netlist modules -> Netlist (List.map transform_ast modules)
+  | Netlist modules -> 
+      (* First pass: collect all functions and tasks from packages *)
+      let symtab = create_symbol_table () in
+      List.iter (collect_functions_tasks symtab) modules;
+      
+      if !debug then
+        Printf.eprintf "Found %d functions and %d tasks across all modules/packages\n"
+          (Hashtbl.length symtab.functions)
+          (Hashtbl.length symtab.tasks);
+      
+      (* Second pass: transform modules *)
+      Netlist (List.map (transform_with_symtab symtab) modules)
+  
+  | _ -> node
+
+and transform_with_symtab symtab node =
+  match node with
   | Module { name; stmts } ->
       if !debug then Printf.eprintf "Transforming module: %s\n" name;
-      Module { name; stmts = transform_module stmts }
+      Module { name; stmts = List.map (transform_stmt symtab) stmts }
+  | Package _ as p -> p  (* Keep packages as-is *)
   | _ -> node
 
 let transform ?(verbose=false) ast =

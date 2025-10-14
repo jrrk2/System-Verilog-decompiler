@@ -11,11 +11,12 @@ open Sv_main;;
 *)
 
 let _ = scan "results/";;
+let ast = Hashtbl.find asthash "Vpackage_test.tree.json";;
+let tran = Hashtbl.find tranhash "Vpackage_test.tree.json";;
 (*
-let ast = Hashtbl.find asthash "Vcomprehensive_sv_testcase.tree.json";;
+let ast = Hashtbl.find asthash "Vloop.tree.json";;
+let tran = Hashtbl.find tranhash "Vloop.tree.json";;
 let ast' = Hashtbl.find asthash "Variane_testharness.tree.json";;
 let ast'' = Hashtbl.find asthash "Vdebug_test.tree.json";;
 let ast3 = Hashtbl.find asthash "Varray_test.tree.json";;
 *)
-let ast = Hashtbl.find asthash "Vloop.tree.json";;
-let tran = Hashtbl.find tranhash "Vloop.tree.json";;

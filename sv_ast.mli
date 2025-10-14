@@ -13,7 +13,8 @@ type sv_type =
   | UnionType of { name: string; packed: bool; members: sv_type list;  }
   | MemberType' of { name: string; dtype: string; child: sv_type list; value: sv_type list;  }
   | MemberType of { name: string; dtype_ref: sv_type option; child: sv_type list; value: sv_type list;  }
-  | RefType of { name: string; resolved: sv_type option }
+  | RefType' of { name: string; dtype: string; refdtype: string }
+  | RefType of { name: string; dtype_ref: sv_type option; refdtype_ref: sv_type option }
   | VoidType of { name: string; resolved: sv_type option }
   | ArrayType' of { base: string; range: string }
   | ArrayType of { base: sv_type; range: string }
@@ -23,6 +24,8 @@ type sv_type =
   | IntfRefType of { ifacename: string; modportname: string; ifacep: sv_node option; modportp: sv_node option }
   | ConstType' of {name: string; dtype: string; child: sv_type list }
   | ConstType of {name: string; dtype_ref: sv_type option; child: sv_type list }
+  | ParamTypeType' of {name:string; dtype: string }
+  | ParamTypeType of {name:string; dtype_ref: sv_type option }
   | UnknownType of string * Yojson.Basic.t
 
 (* AST node types *)

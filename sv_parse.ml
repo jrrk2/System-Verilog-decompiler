@@ -4,7 +4,6 @@ open Yojson.Basic.Util
 (* Parse type table entries *)
 let rec parse_type attr json =
   let node_type = json |> member "type" |> to_string in
-  
   match node_type with
   | "BASICDTYPE" ->
       let keyword = json |> member "keyword" |> to_string_option |> Option.value ~default:"logic" in
@@ -23,7 +22,9 @@ let rec parse_type attr json =
       
   | "REFDTYPE" ->
       let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-      RefType { name; resolved = None }
+      let dtype = json |> member "dtypep" |> to_string in
+      let refdtype = json |> member "refDTypep" |> to_string in
+      RefType' { name; dtype; refdtype }
       
   | "VOIDDTYPE" ->
       let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
@@ -108,7 +109,12 @@ let rec parse_type attr json =
       let child = json |> member "childDTypep" |> to_list |> List.map (parse_type attr) in
       ConstType' { name; dtype; child }
 
-  | oth -> UnknownType (node_type, json )
+  | "PARAMTYPEDTYPE" ->
+      let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      ParamTypeType' { name; dtype }
+
+  | oth -> print_endline oth; UnknownType (node_type, json )
 
 let rec extract_const_value = function
   | `Assoc fields ->
@@ -540,8 +546,8 @@ let rec rw attr = function
 | Netlist lst -> Netlist (rwlst attr lst)
 | Module {name; stmts} -> Module {name; stmts=rwlst attr stmts}
 | Var' {name; dtype_ref; var_type; direction; value; dtype_name; is_param} ->
-  let typ = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) in
-  Var {name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param}
+  let dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) in
+  Var {name; dtype_ref; var_type; direction; value; dtype_name; is_param}
 | Cell' {name; modp_addr; pins } ->
   Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=rwlst attr pins}
 | Pin {name; expr} -> Pin {name; expr=rwopt attr expr}
@@ -714,7 +720,9 @@ and rwtyp attr = function
   ifacep=Hashtbl.find_opt attr.interface_table ifacep;
   modportp=Hashtbl.find_opt attr.interface_table modportp }
 | BasicType _ as t -> t
-| RefType {name; resolved} as t -> t
+| RefType' {name; dtype; refdtype } -> RefType { name;
+    dtype_ref = (try Some (rwtyp attr (Hashtbl.find attr.type_table dtype)) with Not_found -> None);
+    refdtype_ref = (try Some (rwtyp attr (Hashtbl.find attr.type_table refdtype)) with Not_found -> None) }
 | EnumType {name; items} as t -> t
 | StructType { name; packed; members } -> StructType { name; packed; members = List.map (rwtyp attr) members }
 | UnionType { name; packed; members } -> UnionType { name; packed; members = List.map (rwtyp attr) members }
@@ -726,10 +734,14 @@ and rwtyp attr = function
     MemberType { name; dtype_ref; child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
 | ConstType' { name; dtype; child } ->
     ConstType { name;
-    dtype_ref = None (* (try Some (rwtyp attr (Hashtbl.find attr.type_table dtype)) with Not_found -> None) *);
+    dtype_ref = Hashtbl.find_opt attr.type_table dtype;
     child = List.map (rwtyp attr) child }
 | ConstType { name; dtype_ref; child } ->
     ConstType { name; dtype_ref; child = List.map (rwtyp attr) child }
+| ParamTypeType' { name; dtype } ->
+    ParamTypeType { name; dtype_ref = Hashtbl.find_opt attr.type_table dtype }
+| ParamTypeType { name; dtype_ref } ->
+    ParamTypeType { name; dtype_ref }
 | VoidType { name; resolved } -> VoidType { name; resolved }
 | oth -> othrwtyp := Some oth; failwith "othrwtyp"
 

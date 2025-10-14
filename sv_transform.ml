@@ -295,32 +295,39 @@ let unroll_for_loop for_node =
         | _ -> None
       in
       
+      (* FIXED: Handle both directions of comparison *)
       let (bound_val, comparison_op) = match condition with
         | BinaryOp { op; lhs; rhs } ->
             let lhs_c = try_eval_const lhs in
             let rhs_c = try_eval_const rhs in
             (match op, lhs_c, rhs_c with
-            | "GTS", Some b, None -> (Some b, "GTS")
+            (* var < bound *)
             | "LTS", None, Some b -> (Some b, "LTS")
+            | "LT", None, Some b -> (Some b, "LT")
             | "LTES", None, Some b -> (Some b, "LTES")
-            | "GTES", Some b, None -> (Some b, "GTES")
+            | "LTE", None, Some b -> (Some b, "LTE")
+            (* bound > var - SWAP to match var < bound pattern *)
+            | "GTS", Some b, None -> (Some b, "LTS")
+            | "GT", Some b, None -> (Some b, "LT")
+            | "GTES", Some b, None -> (Some b, "LTES")
+            | "GTE", Some b, None -> (Some b, "LTE")
             | _ -> (None, ""))
         | _ -> (None, "")
       in
       
       (match start_val, bound_val, inc_amount with
       | Some start, Some bound, Some inc when inc <> 0 ->
+          (* Calculate iterations based on comparison operator *)
           let num_iters = match comparison_op with
-            | "GTS" -> (bound - start) / inc
-            | "LTS" -> (bound - start) / inc
-            | "LTES" -> ((bound - start) / inc) + 1
-            | "GTES" -> ((bound - start) / inc) + 1
+            | "LTS" | "LT" -> (bound - start) / inc
+            | "LTES" | "LTE" -> ((bound - start) / inc) + 1
             | _ -> 0
           in
           
           if num_iters > 0 && num_iters < max_unroll_iterations then begin
             if !debug then
-              Printf.eprintf "  => Unrolling: %d iterations\n" num_iters;
+              Printf.eprintf "  => Unrolling: %d iterations (start=%d, bound=%d, inc=%d)\n" 
+                num_iters start bound inc;
             
             let rec gen_iter i remaining acc =
               if remaining <= 0 then acc
@@ -332,13 +339,21 @@ let unroll_for_loop for_node =
             let unrolled = gen_iter start num_iters [] in
             stats.loops_unrolled <- stats.loops_unrolled + 1;
             Some unrolled
-          end else
+          end else begin
+            if !debug then
+              Printf.eprintf "  => Cannot unroll: num_iters=%d (max=%d)\n" 
+                num_iters max_unroll_iterations;
             None
+          end
       | _ ->
-          if !debug then Printf.eprintf "  => Cannot unroll (non-constant bounds)\n";
+          if !debug then 
+            Printf.eprintf "  => Cannot unroll (non-constant bounds): start=%s, bound=%s, inc=%s\n"
+              (match start_val with Some v -> string_of_int v | None -> "?")
+              (match bound_val with Some v -> string_of_int v | None -> "?")
+              (match inc_amount with Some v -> string_of_int v | None -> "?");
           None)
   | _ -> None
-
+  
 (* ============================================================================
    FUNCTION AND TASK INLINING
    ============================================================================ *)

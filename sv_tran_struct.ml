@@ -65,34 +65,29 @@ let gen_binary_op ctx op lhs rhs result_wire width =
     | "SHIFTR" -> "shifter_right"
     | _ -> "binary_op"
   in
-  
-  (* Create Cell node (module instance) *)
+
+  (* Separate parameters from ports *)
   let instance = Cell {
     name = inst_name;
     modp_addr = Some (Module { 
       name = module_name; 
-      stmts = [] 
+      stmts = [
+        (* Store parameters as Var nodes with var_type = "GPARAM" *)
+        Var { 
+          name = "WIDTH"; 
+          dtype_ref = None;
+          var_type = "GPARAM";
+          direction = "NONE";
+          value = Some (Const { name = string_of_int width; dtype_ref = None });
+          dtype_name = "";
+          is_param = true;
+        }
+      ] 
     });
     pins = [
-      Pin { name = "WIDTH"; expr = Some (Const { 
-        name = string_of_int width; 
-        dtype_ref = None 
-      })};
-      Pin { name = "a"; expr = Some (VarRef { 
-        name = lhs; 
-        access = "RD"; 
-        dtype_ref = None 
-      })};
-      Pin { name = "b"; expr = Some (VarRef { 
-        name = rhs; 
-        access = "RD"; 
-        dtype_ref = None 
-      })};
-      Pin { name = "out"; expr = Some (VarRef { 
-        name = result_wire; 
-        access = "WR"; 
-        dtype_ref = None 
-      })};
+      Pin { name = "a"; expr = Some (VarRef { name = lhs; access = "RD"; dtype_ref = None })};
+      Pin { name = "b"; expr = Some (VarRef { name = rhs; access = "RD"; dtype_ref = None })};
+      Pin { name = "out"; expr = Some (VarRef { name = result_wire; access = "WR"; dtype_ref = None })};
     ];
   } in
   
@@ -239,11 +234,6 @@ let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
 (* ============================================================================
    UTILITY FUNCTIONS
    ============================================================================ *)
-
-(* Generate unique instance names *)
-let gen_inst_name prefix =
-  incr inst_counter;
-  Printf.sprintf "%s_%d" prefix !inst_counter
 
 (* Add a warning message *)
 let add_warning msg =
@@ -743,6 +733,7 @@ let add_assign_zero ctx lhs_name width =
       } in
       ctx.instances := assign :: !(ctx.instances)
 
+(* Fixed structural_expr with consistent wire declarations *)
 let rec structural_expr ctx expr =
   match expr with
   | VarRef { name; _ } -> name
@@ -753,8 +744,7 @@ let rec structural_expr ctx expr =
       let operand_wire = structural_expr ctx operand in
       let result_wire = gen_inst_name "wire" in
       let width = infer_width ctx (UnaryOp { op; operand; dtype_ref }) in
-      
-      
+      add_wire_decl ctx result_wire width;
       gen_unary_op ctx op operand_wire result_wire width
   
   | BinaryOp { op; lhs; rhs; dtype_ref } ->
@@ -762,10 +752,7 @@ let rec structural_expr ctx expr =
       let rhs_wire = structural_expr ctx rhs in
       let result_wire = gen_inst_name "wire" in
       let width = infer_width ctx (BinaryOp { op; lhs; rhs; dtype_ref }) in
-      
-      (* Add wire declaration *)
-      add_wire_decl ctx result_wire width;      
-      
+      add_wire_decl ctx result_wire width;
       gen_binary_op ctx op lhs_wire rhs_wire result_wire width
   
   | Cond { condition; then_val; else_val } ->
@@ -774,22 +761,7 @@ let rec structural_expr ctx expr =
       let in0 = structural_expr ctx else_val in
       let result_wire = gen_inst_name "wire" in
       let width = max (infer_width ctx then_val) (infer_width ctx else_val) in
-      
-      (* Add wire declaration *)
-      let wire_decl = Var {
-        name = result_wire;
-        dtype_ref = Some (BasicType { 
-          keyword = "logic"; 
-          range = Some (Printf.sprintf "%d:0" (width-1))
-        });
-        var_type = "VAR";
-        direction = "NONE";
-        value = None;
-        dtype_name = "";
-        is_param = false;
-      } in
-      ctx.wires := wire_decl :: !(ctx.wires);
-      
+      add_wire_decl ctx result_wire width;
       gen_mux ctx sel in0 in1 result_wire width
   
   | Sel { expr; lsb; width; _ } ->
@@ -804,11 +776,34 @@ let rec structural_expr ctx expr =
           Printf.sprintf "%s[%s]" base lsb_str
       | _ -> base)
   
-  | _ -> "/* unsupported */"
-
-(* Keep rest of infer_width, validate functions etc. the same *)
-(* ... *)
-
+  | ArraySel { expr; index } ->
+      let base_name = structural_expr ctx expr in
+      let idx_str = structural_expr ctx index in
+      Printf.sprintf "%s[%s]" base_name idx_str
+  
+  | Concat { parts } ->
+      (* For concat, need to create intermediate wire *)
+      let part_names = List.map (structural_expr ctx) parts in
+      let result_wire = gen_inst_name "wire" in
+      let width = List.fold_left (fun acc p -> acc + infer_width ctx p) 0 parts in
+      add_wire_decl ctx result_wire width;
+      
+      (* Create concat assign *)
+      let concat_rhs = Printf.sprintf "{%s}" (String.concat ", " part_names) in
+      ctx.instances := AssignW {
+        lhs = VarRef { name = result_wire; access = "WR"; dtype_ref = None };
+        rhs = Const { name = concat_rhs; dtype_ref = None };
+      } :: !(ctx.instances);
+      result_wire
+  
+  | Replicate { src; count; _ } ->
+      let src_name = structural_expr ctx src in
+      let count_name = structural_expr ctx count in
+      Printf.sprintf "{%s{%s}}" count_name src_name
+  
+  | _ -> 
+      add_warning "Unsupported expression in structural conversion";
+      "/* unsupported */"
 (* ============================================================================
    STATEMENT CONVERSION
    ============================================================================ *)
@@ -816,7 +811,8 @@ let rec structural_expr ctx expr =
 let structural_assign ctx lhs rhs is_sequential =
   let lhs_name = match lhs with
     | VarRef { name; _ } -> name
-    | _ -> structural_expr ctx lhs
+    | Sel _ | ArraySel _ -> structural_expr ctx lhs
+    | _ -> "unknown"
   in
   let rhs_wire = structural_expr ctx rhs in
   
@@ -832,16 +828,29 @@ let structural_assign ctx lhs rhs is_sequential =
     | None ->
         add_warning "Sequential assignment without clock context"
   end else begin
-    (* Create AssignW node *)
-    add_assign_decl ctx lhs_name rhs_wire
+    if rhs_wire <> lhs_name then begin
+      let width = match get_var ctx lhs_name with
+        | Some { width; _ } -> width
+        | None -> infer_width ctx rhs
+      in
+      let range_str = if width > 1 
+        then Some (Printf.sprintf "%d:0" (width - 1))
+        else None in
+      
+      let assign = AssignW {
+        lhs = VarRef { name = lhs_name; access = "WR";
+                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+        rhs = VarRef { name = rhs_wire; access = "RD";
+                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+      } in
+      ctx.instances := assign :: !(ctx.instances)
+    end
   end
-
 
 (* ============================================================================
    STATEMENT CONVERSION
    ============================================================================ *)
 
-(* Convert assignment to structural form *)
 let structural_assign ctx lhs rhs is_sequential =
   let lhs_name = match lhs with
     | VarRef { name; _ } -> name
@@ -855,22 +864,30 @@ let structural_assign ctx lhs rhs is_sequential =
       | Some { width; _ } -> width
       | None -> infer_width ctx rhs
     in
-    let d_wire = rhs_wire in
-    let q_wire = lhs_name in
     match ctx.current_clock with
     | Some clk ->
-        let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None d_wire q_wire width 0 in
+        let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
         ()
     | None ->
         add_warning "Sequential assignment without clock context"
   end else begin
-    (* Only create assign if RHS is not the same as LHS *)
-    if rhs_wire <> lhs_name then
-    ctx.instances := Assign {lhs = VarRef {name = lhs_name; access = "WR";
-        dtype_ref = Some (BasicType {keyword = "logic"; range = Some "15:0"})};
-            rhs = VarRef {name = rhs_wire; access = "RD";
-            dtype_ref = Some (BasicType {keyword = "logic"; range = Some "15:0"})};
-					is_blocking = true} :: !(ctx.instances)
+    if rhs_wire <> lhs_name then begin
+      let width = match get_var ctx lhs_name with
+        | Some { width; _ } -> width
+        | None -> infer_width ctx rhs
+      in
+      let range_str = if width > 1 
+        then Some (Printf.sprintf "%d:0" (width - 1))
+        else None in
+      
+      let assign = AssignW {
+        lhs = VarRef { name = lhs_name; access = "WR";
+                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+        rhs = VarRef { name = rhs_wire; access = "RD";
+                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+      } in
+      ctx.instances := assign :: !(ctx.instances)
+    end
   end
 
 (* Convert if statement to structural muxes *)
@@ -1254,23 +1271,40 @@ let structural_module name stmts packages =
   let type_params = extract_type_params stmts in
   
   (* Recursive variable collection including SSA vars *)
-  let rec collect_vars acc = function
-    | [] -> acc
-    | Var { name; dtype_ref; dtype_name; var_type; direction; value; is_param } :: rest ->
+(* Recursive variable collection including SSA vars *)
+let rec collect_vars ctx acc stmts =
+  List.fold_left (fun acc stmt ->
+    match stmt with
+    | Var { name; dtype_ref; dtype_name; var_type; direction; value; is_param } ->
         let is_reg = var_type = "VAR" in
         add_var ctx name dtype_ref dtype_name is_reg;
-        collect_vars (Var { name; dtype_ref; dtype_name; var_type; 
-                           direction; value; is_param } :: acc) rest
-    | Always { stmts = inner; _ } :: rest ->
-        collect_vars (collect_vars acc inner) rest
-    | Begin { stmts = inner; is_generate = false; _ } :: rest ->
-        collect_vars (collect_vars acc inner) rest
-    | _ :: rest ->
-        collect_vars acc rest
-  in
+        stmt :: acc
+    
+    | Always { stmts = inner; _ } ->
+        collect_vars ctx acc inner
+    
+    | Begin { stmts = inner; is_generate = false; _ } ->
+        collect_vars ctx acc inner
+    
+    | If { then_stmt; else_stmt; _ } ->
+        let acc' = collect_vars ctx acc [then_stmt] in
+        (match else_stmt with
+        | Some es -> collect_vars ctx acc' [es]
+        | None -> acc')
+    
+    | Case { items; _ } ->
+        List.fold_left (fun acc item ->
+          collect_vars ctx acc item.statements
+        ) acc items
+    
+    | For { stmts = inner; _ } ->
+        collect_vars ctx acc inner
+    
+    | _ -> acc
+  ) acc stmts in
     
   (* Collect variables *)
-  let all_vars = collect_vars [] stmts in
+  let all_vars = collect_vars ctx [] stmts in
   
   (* Transform statements - accumulates nodes in ctx *)
   List.iter (structural_stmt ctx) stmts;
@@ -1312,7 +1346,7 @@ let structural_module name stmts packages =
   ) all_vars in
   
   (* Build module body: internal vars + wires + instances *)
-  let body_stmts = 
+  let body_stmts =
     internal_vars @ 
     (List.rev !(ctx.wires)) @ 
     (List.rev !(ctx.instances)) in

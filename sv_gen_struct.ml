@@ -979,7 +979,7 @@ and structural_latch ctx stmts =
     let _ = gen_latch_en ctx enable_sig rhs_wire lhs_name width in
     ()
   ) assigns
-  
+
 (* Convert module to structural form - NOT part of mutual recursion *)
 let structural_module name stmts =
   add_warning (Printf.sprintf "Converting module '%s' to structural form" name);
@@ -996,20 +996,53 @@ let structural_module name stmts =
   (* Second pass - convert logic *)
   List.iter (structural_stmt ctx) stmts;
   
-  (* Generate output *)
+  (* Generate ports with proper array ranges *)
   let ports = List.filter_map (function
     | Var { name; dtype_ref; dtype_name; var_type = "PORT"; direction; _ } ->
-        let type_str = resolve_type_with_brackets dtype_name dtype_ref in
+        let type_str = match dtype_ref with
+          | Some (ArrayType { base; range }) ->
+              let base_type = resolve_type (Some base) in
+              Printf.sprintf "%s [%s]" base_type range
+          | _ -> 
+              resolve_type_with_brackets dtype_name dtype_ref
+        in
         Some (Printf.sprintf "  %s %s %s" (String.lowercase_ascii direction) type_str name)
     | _ -> None
   ) stmts in
   
+  (* Generate internal variable declarations (SSA variables, etc.) *)
+  let internal_vars = List.filter_map (function
+    | Var { name; dtype_ref; dtype_name; var_type = "VAR"; _ } ->
+        let type_str = match dtype_ref with
+          | Some (ArrayType { base; range }) ->
+              let base_type = resolve_type (Some base) in
+              Printf.sprintf "  %s [%s] %s;" base_type range name
+          | Some (BasicType { keyword; range = Some r }) ->
+              Printf.sprintf "  %s [%s] %s;" keyword r name
+          | Some (BasicType { keyword; range = None }) ->
+              Printf.sprintf "  %s %s;" keyword name
+          | _ ->
+              Printf.sprintf "  logic %s;" name
+        in
+        Some type_str
+    | _ -> None
+  ) stmts in
+  
   let port_str = String.concat ",\n" ports in
+  let internal_vars_str = String.concat "\n" internal_vars in
   let wires_str = String.concat "\n" (List.rev !(ctx.wires)) in
   let instances_str = String.concat "\n" (List.rev !(ctx.instances)) in
   
-  Printf.sprintf "module %s (\n%s\n);\n\n%s\n\n%s\n\nendmodule" 
-    name port_str wires_str instances_str
+  (* Combine: ports, then internal vars, then wires, then instances *)
+  let body_parts = [
+    (if internal_vars_str <> "" then internal_vars_str else "");
+    (if wires_str <> "" then wires_str else "");
+    instances_str
+  ] in
+  let body_str = String.concat "\n\n" (List.filter (fun s -> s <> "") body_parts) in
+  
+  Printf.sprintf "module %s (\n%s\n);\n\n%s\n\nendmodule" 
+    name port_str body_str    
 
 (* Main entry point *)
 let rec generate_structural node indent =

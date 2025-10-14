@@ -403,6 +403,7 @@ module mux4 #(
   end
 endmodule
 
+/*
 // N-to-1 multiplexer (parameterized)
 module mux_n #(
   parameter WIDTH = 32,
@@ -414,6 +415,7 @@ module mux_n #(
 );
   assign out = in[sel];
 endmodule
+*/
 
 // Priority encoder
 module priority_encoder #(

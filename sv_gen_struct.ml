@@ -980,53 +980,84 @@ and structural_latch ctx stmts =
     ()
   ) assigns
 
-(* Convert module to structural form - NOT part of mutual recursion *)
 let structural_module name stmts =
   add_warning (Printf.sprintf "Converting module '%s' to structural form" name);
   let ctx = create_context () in
   
-  (* First pass - collect variables *)
-  List.iter (function
-    | Var { name; dtype_ref; dtype_name; var_type; _ } ->
+  (* First pass - collect ALL variables (including SSA vars) *)
+  let rec collect_vars acc = function
+    | [] -> acc
+    | Var { name; dtype_ref; dtype_name; var_type; _ } :: rest ->
         let is_reg = var_type = "VAR" in
-        add_var ctx name dtype_ref dtype_name is_reg
-    | _ -> ()
-  ) stmts;
+        add_var ctx name dtype_ref dtype_name is_reg;
+        collect_vars (Var { name; dtype_ref; dtype_name; var_type; 
+                           direction = "NONE"; value = None; is_param = false } :: acc) rest
+    | Always { stmts = inner; _ } :: rest ->
+        collect_vars (collect_vars acc inner) rest
+    | Begin { stmts = inner; _ } :: rest ->
+        collect_vars (collect_vars acc inner) rest
+    | _ :: rest ->
+        collect_vars acc rest
+  in
+  
+  let all_vars = collect_vars [] stmts in
   
   (* Second pass - convert logic *)
   List.iter (structural_stmt ctx) stmts;
   
-  (* Generate ports with proper array ranges *)
+  (* Helper to extract width from type *)
+  let get_width_str dtype_ref dtype_name =
+    match dtype_ref with
+    | Some (ArrayType { base; range }) ->
+        Printf.sprintf " [%s]" range
+    | Some (PackArrayType { base; range }) ->
+        Printf.sprintf " [%s]" range
+    | Some (BasicType { range = Some r; _ }) ->
+        Printf.sprintf " [%s]" r
+    | _ when dtype_name <> "" && String.contains dtype_name '[' ->
+        (* Extract range from dtype_name like "logic [3:0]" *)
+        let start_idx = String.index dtype_name '[' in
+        let end_idx = String.index dtype_name ']' in
+        " " ^ String.sub dtype_name start_idx (end_idx - start_idx + 1)
+    | _ -> ""
+  in
+  
+  (* Helper to get base type *)
+  let get_base_type dtype_ref dtype_name =
+    match dtype_ref with
+    | Some (ArrayType { base = BasicType { keyword; _ }; _ }) -> keyword
+    | Some (PackArrayType { base = BasicType { keyword; _ }; _ }) -> keyword
+    | Some (BasicType { keyword; _ }) -> keyword
+    | _ when dtype_name <> "" && dtype_name <> "logic" -> 
+        (* Extract base from dtype_name *)
+        if String.contains dtype_name '[' then
+          String.trim (String.sub dtype_name 0 (String.index dtype_name '['))
+        else
+          dtype_name
+    | _ -> "logic"
+  in
+  
+  (* Generate ports with proper widths *)
   let ports = List.filter_map (function
     | Var { name; dtype_ref; dtype_name; var_type = "PORT"; direction; _ } ->
-        let type_str = match dtype_ref with
-          | Some (ArrayType { base; range }) ->
-              let base_type = resolve_type (Some base) in
-              Printf.sprintf "%s [%s]" base_type range
-          | _ -> 
-              resolve_type_with_brackets dtype_name dtype_ref
-        in
-        Some (Printf.sprintf "  %s %s %s" (String.lowercase_ascii direction) type_str name)
+        let base_type = get_base_type dtype_ref dtype_name in
+        let width_str = get_width_str dtype_ref dtype_name in
+        Some (Printf.sprintf "  %s%s %s" 
+               (String.lowercase_ascii direction) 
+               (if width_str <> "" then width_str else " " ^ base_type)
+               name)
     | _ -> None
   ) stmts in
   
-  (* Generate internal variable declarations (SSA variables, etc.) *)
+  (* Generate internal variable declarations (all non-port vars) *)
   let internal_vars = List.filter_map (function
-    | Var { name; dtype_ref; dtype_name; var_type = "VAR"; _ } ->
-        let type_str = match dtype_ref with
-          | Some (ArrayType { base; range }) ->
-              let base_type = resolve_type (Some base) in
-              Printf.sprintf "  %s [%s] %s;" base_type range name
-          | Some (BasicType { keyword; range = Some r }) ->
-              Printf.sprintf "  %s [%s] %s;" keyword r name
-          | Some (BasicType { keyword; range = None }) ->
-              Printf.sprintf "  %s %s;" keyword name
-          | _ ->
-              Printf.sprintf "  logic %s;" name
-        in
-        Some type_str
+    | Var { name; dtype_ref; dtype_name; var_type; _ } 
+      when var_type <> "PORT" ->
+        let base_type = get_base_type dtype_ref dtype_name in
+        let width_str = get_width_str dtype_ref dtype_name in
+        Some (Printf.sprintf "  %s%s %s;" base_type width_str name)
     | _ -> None
-  ) stmts in
+  ) all_vars in
   
   let port_str = String.concat ",\n" ports in
   let internal_vars_str = String.concat "\n" internal_vars in

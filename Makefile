@@ -7,7 +7,7 @@ OCAMLLEX = ocamllex
 
 SOURCES = sv_ast.mli sv_parse.ml sv_gen.ml sv_main.ml
 SOURCES_YOSYS = sv_ast.mli sv_parse.ml sv_gen_yosys.ml sv_main_yosys.ml
-SOURCES_STRUCT = sv_ast.mli sv_parse.ml sv_transform.ml sv_gen_struct.ml sv_main_struct.ml
+SOURCES_STRUCT = sv_ast.mli sv_parse.ml sv_transform.ml sv_tran_struct.ml sv_gen.ml sv_gen_struct.ml sv_main_struct.ml
 
 TARGET = json_verilog
 TARGET_TOP = json_verilog_top

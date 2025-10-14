@@ -850,22 +850,3 @@ module multiplier_signed #(
 );
   assign out = a * b;
 endmodule
-
-// D flip-flop with enable (posedge)
-module dff_en #(
-  parameter WIDTH = 1,
-  parameter RESET_VAL = 0
-) (
-  input  logic clk,
-  input  logic rst,
-  input  logic en,
-  input  logic [WIDTH-1:0] d,
-  output logic [WIDTH-1:0] q
-);
-  always_ff @(posedge clk or posedge rst) begin
-    if (rst)
-      q <= RESET_VAL;
-    else if (en)
-      q <= d;
-  end
-endmodule // dff_en

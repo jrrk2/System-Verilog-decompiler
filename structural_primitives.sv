@@ -828,3 +828,44 @@ module pulse_generator_multi #(
   
   assign pulse = active;
 endmodule
+
+// Sign extender
+module sign_extender #(
+  parameter WIDTH_IN = 8,
+  parameter WIDTH_OUT = 16
+) (
+  input  logic [WIDTH_IN-1:0]  in,
+  output logic [WIDTH_OUT-1:0] out
+);
+  assign out = {{(WIDTH_OUT-WIDTH_IN){in[WIDTH_IN-1]}}, in};
+endmodule
+
+// Signed multiplier
+module multiplier_signed #(
+  parameter WIDTH = 16
+) (
+  input  logic signed [WIDTH-1:0] a,
+  input  logic signed [WIDTH-1:0] b,
+  output logic signed [WIDTH-1:0] out
+);
+  assign out = a * b;
+endmodule
+
+// D flip-flop with enable (posedge)
+module dff_en #(
+  parameter WIDTH = 1,
+  parameter RESET_VAL = 0
+) (
+  input  logic clk,
+  input  logic rst,
+  input  logic en,
+  input  logic [WIDTH-1:0] d,
+  output logic [WIDTH-1:0] q
+);
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst)
+      q <= RESET_VAL;
+    else if (en)
+      q <= d;
+  end
+endmodule // dff_en

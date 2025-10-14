@@ -1,5 +1,5 @@
 (* ============================================================================
-   sv_gen_struct.ml - Complete structural code generator
+   sv_gen_struct.ml - Complete structural code generator with full type support
    ============================================================================ *)
 
 open Sv_ast
@@ -27,6 +27,7 @@ type structural_context = {
   instances: string list ref;
   mutable in_sequential: bool;
   mutable current_clock: string option;
+  mutable current_clock_edge: [`Posedge | `Negedge] option;
   mutable current_reset: string option;
 }
 
@@ -37,6 +38,7 @@ let create_context () = {
   instances = ref [];
   in_sequential = false;
   current_clock = None;
+  current_clock_edge = None;
   current_reset = None;
 }
 
@@ -61,6 +63,47 @@ let get_warnings () = List.rev !warnings
 let clear_warnings () = 
   warnings := [];
   inst_counter := 0
+
+(* Try to evaluate constant expressions *)
+let rec try_eval_const expr =
+  match expr with
+  | Const { name; _ } ->
+      (try
+        if String.contains name '\'' then
+          let parts = String.split_on_char '\'' name in
+          match parts with
+          | _ :: rest ->
+              let value_str = String.concat "'" rest in
+              if String.length value_str >= 2 then
+                let base = value_str.[0] in
+                let num_str = String.sub value_str 1 (String.length value_str - 1) in
+                (match base with
+                | 's' when String.length value_str > 2 ->
+                    let actual_base = value_str.[1] in
+                    let actual_num = String.sub value_str 2 (String.length value_str - 2) in
+                    (match actual_base with
+                    | 'h' -> Some (int_of_string ("0x" ^ actual_num))
+                    | 'd' -> Some (int_of_string actual_num)
+                    | _ -> None)
+                | 'h' -> Some (int_of_string ("0x" ^ num_str))
+                | 'd' -> Some (int_of_string num_str)
+                | 'b' -> Some (int_of_string ("0b" ^ num_str))
+                | _ -> Some (int_of_string value_str))
+              else Some (int_of_string value_str)
+          | _ -> Some (int_of_string name)
+        else Some (int_of_string name)
+      with _ -> None)
+  | BinaryOp { op; lhs; rhs; _ } ->
+      (match try_eval_const lhs, try_eval_const rhs with
+      | Some l, Some r ->
+          (match op with
+          | "ADD" -> Some (l + r)
+          | "SUB" -> Some (l - r)
+          | "MUL" | "MULS" -> Some (l * r)
+          | "DIV" | "DIVS" when r <> 0 -> Some (l / r)
+          | _ -> None)
+      | _ -> None)
+  | _ -> None
 
 (* ============================================================================
    TYPE RESOLUTION
@@ -89,25 +132,7 @@ let resolve_enum_constant packages const_name =
           | Typedef { dtype_ref = Some (EnumType { items; _ }); _ } ->
               List.find_map (fun (name, value) ->
                 if name = const_name then
-                  (* Parse "2'h3" -> 3 *)
-                  try
-                    if String.contains value '\'' then
-                      let parts = String.split_on_char '\'' value in
-                      match parts with
-                      | _ :: rest ->
-                          let value_str = String.concat "'" rest in
-                          if String.length value_str >= 2 then
-                            let base = value_str.[0] in
-                            let num_str = String.sub value_str 1 (String.length value_str - 1) in
-                            (match base with
-                            | 'h' -> Some (int_of_string ("0x" ^ num_str))
-                            | 'd' -> Some (int_of_string num_str)
-                            | 'b' -> Some (int_of_string ("0b" ^ num_str))
-                            | _ -> Some (int_of_string value))
-                          else Some (int_of_string value_str)
-                      | _ -> Some (int_of_string value)
-                    else Some (int_of_string value)
-                  with _ -> None
+                  try_eval_const (Const { name = value; dtype_ref = None })
                 else None
               ) items
           | _ -> None
@@ -125,6 +150,18 @@ let resolve_type_from_packages packages type_name =
         ) stmts
     | _ -> None
   ) packages
+
+(* Parse range string to width *)
+let parse_range_width range =
+  try
+    let parts = String.split_on_char ':' range in
+    match parts with
+    | [msb; lsb] -> 
+        let m = int_of_string (String.trim msb) in
+        let l = int_of_string (String.trim lsb) in
+        abs (m - l) + 1
+    | _ -> 1
+  with _ -> 1
 
 (* Get width string with full resolution *)
 let rec get_width_str_resolved packages type_params dtype_ref dtype_name =
@@ -161,15 +198,7 @@ let rec get_width_str_resolved packages type_params dtype_ref dtype_name =
       let total_width = List.fold_left (fun acc member ->
         match member with
         | MemberType { dtype_ref = Some (BasicType { range = Some r; _ }); _ } ->
-            (try
-              let parts = String.split_on_char ':' r in
-              match parts with
-              | [msb; lsb] -> 
-                  let m = int_of_string (String.trim msb) in
-                  let l = int_of_string (String.trim lsb) in
-                  acc + (abs (m - l) + 1)
-              | _ -> acc + 1
-            with _ -> acc + 1)
+            acc + parse_range_width r
         | MemberType { dtype_ref = Some (BasicType { range = None; _ }); _ } ->
             acc + 1
         | _ -> acc
@@ -233,44 +262,35 @@ let get_base_type_resolved packages type_params dtype_ref dtype_name =
 (* Extract bit width from type *)
 let get_bit_width dtype_ref dtype_name =
   match dtype_ref with
-  | Some (BasicType { range = Some r; _ }) ->
-      (try
-        let parts = String.split_on_char ':' r in
-        match parts with
-        | [msb; lsb] -> 
-            let m = int_of_string (String.trim msb) in
-            let l = int_of_string (String.trim lsb) in
-            abs (m - l) + 1
-        | _ -> 1
-      with _ -> 1)
-  | Some (ArrayType { range; _ }) ->
-      (try
-        let parts = String.split_on_char ':' range in
-        match parts with
-        | [msb; lsb] -> 
-            let m = int_of_string (String.trim msb) in
-            let l = int_of_string (String.trim lsb) in
-            abs (m - l) + 1
-        | _ -> 1
-      with _ -> 1)
+  | Some (BasicType { range = Some r; _ }) -> parse_range_width r
+  | Some (ArrayType { range; _ }) -> parse_range_width range
   | _ -> 1
 
 (* Add variable to context *)
 let add_var ctx name dtype_ref dtype_name is_reg =
+  if Hashtbl.mem ctx.variables name then
+    add_warning (Printf.sprintf "Variable redefinition: %s" name);
   let width = get_bit_width dtype_ref dtype_name in
-  Hashtbl.add ctx.variables name { name; dtype_ref; dtype_name; is_reg; width }
+  Hashtbl.replace ctx.variables name { name; dtype_ref; dtype_name; is_reg; width }
 
 (* Get variable info *)
 let get_var ctx name =
   try Some (Hashtbl.find ctx.variables name)
   with Not_found -> None
 
-(* Infer width from expression *)
+(* Infer width from expression - NOW USES dtype_ref! *)
 let rec infer_width ctx = function
+  (* Use dtype_ref when available - this is authoritative! *)
+  | UnaryOp { dtype_ref = Some (BasicType { range = Some r; _ }); _ }
+  | BinaryOp { dtype_ref = Some (BasicType { range = Some r; _ }); _ }
+  | VarRef { dtype_ref = Some (BasicType { range = Some r; _ }); _ } ->
+      parse_range_width r
+  
   | VarRef { name; _ } ->
       (match get_var ctx name with
       | Some { width; _ } -> width
       | None -> 1)
+  
   | Const { name; _ } ->
       if String.contains name '\'' then
         (try
@@ -280,16 +300,47 @@ let rec infer_width ctx = function
           | _ -> 32
         with _ -> 32)
       else 32
+  
+  (* Fallback cases when dtype_ref not available *)
+  | BinaryOp { op = "MUL" | "MULS"; lhs; rhs; _ } ->
+      (* Multiplication result can be wider *)
+      infer_width ctx lhs + infer_width ctx rhs
+  
+  | BinaryOp { op = "SHIFTL" | "SHIFTR" | "SHIFTRS"; lhs; _ } ->
+      (* Shift result width = LHS width *)
+      infer_width ctx lhs
+  
   | BinaryOp { lhs; rhs; _ } ->
       max (infer_width ctx lhs) (infer_width ctx rhs)
+  
   | UnaryOp { operand; _ } ->
       infer_width ctx operand
-  | Sel { expr; _ } | ArraySel { expr; _ } ->
-      infer_width ctx expr
+  
+  | Sel { width = Some w; _ } ->
+      (match try_eval_const w with Some n -> n | None -> 1)
+  
+  | Sel { lsb = Some _; width = None; _ } ->
+      1  (* Single bit select *)
+  
+  | ArraySel { expr; _ } ->
+      (* Array element access returns base element width *)
+      (match get_var ctx (match expr with VarRef { name; _ } -> name | _ -> "") with
+      | Some { dtype_ref = Some (ArrayType { base = BasicType { range = Some r; _ }; _ }); _ } ->
+          parse_range_width r
+      | _ -> infer_width ctx expr)
+  
   | Cond { then_val; else_val; _ } ->
       max (infer_width ctx then_val) (infer_width ctx else_val)
+  
   | Concat { parts } ->
+      (* Sum of all part widths *)
       List.fold_left (fun acc p -> acc + infer_width ctx p) 0 parts
+  
+  | Replicate { src; count; _ } ->
+      (match try_eval_const count with
+      | Some n -> n * infer_width ctx src
+      | None -> infer_width ctx src)
+  
   | _ -> 1
 
 (* Check if an expression depends on a variable (for loop detection) *)
@@ -328,20 +379,21 @@ type always_block_type =
 (* Detect edge type from sensitivity *)
 let detect_edge edge_str =
   let lower = String.lowercase_ascii edge_str in
-  if String.contains lower 'p' || lower = "posedge" then `Posedge
-  else if String.contains lower 'n' || lower = "negedge" then `Negedge
+  if String.contains lower 'p' || lower = "pos" || lower = "posedge" then `Posedge
+  else if String.contains lower 'n' || lower = "neg" || lower = "negedge" then `Negedge
   else failwith ("Unknown edge type: " ^ edge_str)
 
 (* Detect clock signals *)
 let is_clock_signal name =
   let lower = String.lowercase_ascii name in
   lower = "clk" || lower = "clock" || 
-  (String.contains lower 'c' && String.contains lower 'l' && String.contains lower 'k')
+  String.starts_with ~prefix:"clk" lower
 
 (* Detect reset signals *)
 let is_reset_signal name =
   let lower = String.lowercase_ascii name in
-  lower = "rst" || lower = "reset" || lower = "rstn" || lower = "rst_n"
+  lower = "rst" || lower = "reset" || lower = "rstn" || lower = "rst_n" ||
+  String.starts_with ~prefix:"rst" lower
 
 (* Analyze sensitivity list *)
 let analyze_sensitivity_detailed senses =
@@ -382,7 +434,7 @@ let rec detect_reset_pattern stmt =
       (match condition with
       | VarRef { name; _ } when is_reset_signal name ->
           if has_only_resets then_stmt then Some (name, `Sync) else None
-      | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ } } when is_reset_signal name ->
+      | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ }; _ } when is_reset_signal name ->
           if has_only_resets then_stmt then Some (name, `Sync) else None
       | _ -> None)
   | Begin { stmts; _ } ->
@@ -430,17 +482,23 @@ let gen_binary_op ctx op lhs rhs result_wire width =
   let module_name = match op with
     | "ADD" -> "adder"
     | "SUB" -> "subtractor"
-    | "MUL" | "MULS" -> "multiplier"
-    | "DIV" | "DIVS" -> "divider"
+    | "MUL" -> "multiplier"
+    | "MULS" -> "multiplier_signed"
+    | "DIV" -> "divider"
+    | "DIVS" -> "divider_signed"
     | "AND" -> "bitwise_and"
     | "OR" -> "bitwise_or"
     | "XOR" -> "bitwise_xor"
     | "EQ" -> "comparator_eq"
     | "NEQ" -> "comparator_neq"
-    | "LT" | "LTS" -> "comparator_lt"
-    | "GT" | "GTS" -> "comparator_gt"
-    | "LTE" | "LTES" -> "comparator_lte"
-    | "GTE" | "GTES" -> "comparator_gte"
+    | "LT" -> "comparator_lt"
+    | "LTS" -> "comparator_lt_signed"
+    | "GT" -> "comparator_gt"
+    | "GTS" -> "comparator_gt_signed"
+    | "LTE" -> "comparator_lte"
+    | "LTES" -> "comparator_lte_signed"
+    | "GTE" -> "comparator_gte"
+    | "GTES" -> "comparator_gte_signed"
     | "SHIFTL" -> "shifter_left"
     | "SHIFTR" -> "shifter_right"
     | "SHIFTRS" -> "shifter_right_arith"
@@ -477,8 +535,14 @@ let gen_mux ctx sel in0 in1 result_wire width =
   result_wire
 
 (* Generate D flip-flop with enable *)
-let gen_dff_en ctx clk rst en d q width reset_val =
+let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
   let inst_name = gen_inst_name "dff" in
+  
+  let (clk_sig, module_name) = match clk_edge with
+    | Some `Posedge -> (clk, "dff_en")
+    | Some `Negedge -> (clk, "dffn_en")
+    | None -> (clk, "dff_en")
+  in
   
   let rst_port = match rst with
     | Some r -> Printf.sprintf ".rst(%s)" r
@@ -491,8 +555,8 @@ let gen_dff_en ctx clk rst en d q width reset_val =
   in
   
   ctx.instances := 
-    (Printf.sprintf "  dff_en #(.WIDTH(%d), .RESET_VAL(%d)) %s (.clk(%s), %s, %s, .d(%s), .q(%s));" 
-      width reset_val inst_name clk rst_port en_port d q) :: !(ctx.instances);
+    (Printf.sprintf "  %s #(.WIDTH(%d), .RESET_VAL(%d)) %s (.clk(%s), %s, %s, .d(%s), .q(%s));" 
+      module_name width reset_val inst_name clk_sig rst_port en_port d q) :: !(ctx.instances);
   q
 
 (* Generate latch primitive *)
@@ -520,20 +584,50 @@ let rec structural_expr ctx expr =
   
   | Const { name; _ } -> name
   
-  | BinaryOp { op; lhs; rhs } ->
+  | UnaryOp { op = "EXTENDS"; operand; dtype_ref } ->
+      let operand_wire = structural_expr ctx operand in
+      let result_wire = gen_inst_name "wire" in
+      
+      let input_width = infer_width ctx operand in
+      let output_width = infer_width ctx (UnaryOp { op = "EXTENDS"; operand; dtype_ref }) in
+      
+      ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (output_width-1) result_wire) :: !(ctx.wires);
+      
+      let inst_name = gen_inst_name "ext" in
+      ctx.instances := 
+        (Printf.sprintf "  sign_extender #(.WIDTH_IN(%d), .WIDTH_OUT(%d)) %s (.in(%s), .out(%s));" 
+          input_width output_width inst_name operand_wire result_wire) :: !(ctx.instances);
+      result_wire
+  
+  | UnaryOp { op = "EXTEND"; operand; dtype_ref } ->
+      let operand_wire = structural_expr ctx operand in
+      let result_wire = gen_inst_name "wire" in
+      
+      let input_width = infer_width ctx operand in
+      let output_width = infer_width ctx (UnaryOp { op = "EXTEND"; operand; dtype_ref }) in
+      
+      ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (output_width-1) result_wire) :: !(ctx.wires);
+      
+      let inst_name = gen_inst_name "ext" in
+      ctx.instances := 
+        (Printf.sprintf "  zero_extender #(.WIDTH_IN(%d), .WIDTH_OUT(%d)) %s (.in(%s), .out(%s));" 
+          input_width output_width inst_name operand_wire result_wire) :: !(ctx.instances);
+      result_wire
+  
+  | UnaryOp { op; operand; dtype_ref } ->
+      let operand_wire = structural_expr ctx operand in
+      let result_wire = gen_inst_name "wire" in
+      let width = infer_width ctx (UnaryOp { op; operand; dtype_ref }) in
+      ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (width-1) result_wire) :: !(ctx.wires);
+      gen_unary_op ctx op operand_wire result_wire width
+  
+  | BinaryOp { op; lhs; rhs; dtype_ref } ->
       let lhs_wire = structural_expr ctx lhs in
       let rhs_wire = structural_expr ctx rhs in
       let result_wire = gen_inst_name "wire" in
-      let width = max (infer_width ctx lhs) (infer_width ctx rhs) in
+      let width = infer_width ctx (BinaryOp { op; lhs; rhs; dtype_ref }) in
       ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (width-1) result_wire) :: !(ctx.wires);
       gen_binary_op ctx op lhs_wire rhs_wire result_wire width
-  
-  | UnaryOp { op; operand } ->
-      let operand_wire = structural_expr ctx operand in
-      let result_wire = gen_inst_name "wire" in
-      let width = infer_width ctx operand in
-      ctx.wires := (Printf.sprintf "  logic [%d:0] %s;" (width-1) result_wire) :: !(ctx.wires);
-      gen_unary_op ctx op operand_wire result_wire width
   
   | Cond { condition; then_val; else_val } ->
       let sel = structural_expr ctx condition in
@@ -577,6 +671,18 @@ let rec structural_expr ctx expr =
       in
       Printf.sprintf "$clog2(%s)" arg_str
   
+  | FuncRef { name; _ } ->
+      add_warning (Printf.sprintf "Unsupported function call: %s" name);
+      ctx.instances := 
+        (Printf.sprintf "  // UNSUPPORTED: function call %s(...)" name) :: !(ctx.instances);
+      "/* func_result */"
+  
+  | TaskRef { name; _ } ->
+      add_warning (Printf.sprintf "Unsupported task call: %s" name);
+      ctx.instances := 
+        (Printf.sprintf "  // UNSUPPORTED: task call %s(...)" name) :: !(ctx.instances);
+      "/* task_result */"
+  
   | _ ->
       add_warning "Unsupported expression in structural conversion";
       "/* unsupported */"
@@ -592,8 +698,6 @@ let structural_assign ctx lhs rhs is_sequential =
     | Sel _ | ArraySel _ -> structural_expr ctx lhs
     | _ -> "unknown"
   in
-  
-  (* Check if RHS is already a wire from a previous operation *)
   let rhs_wire = structural_expr ctx rhs in
   
   if is_sequential then begin
@@ -605,12 +709,12 @@ let structural_assign ctx lhs rhs is_sequential =
     let q_wire = lhs_name in
     match ctx.current_clock with
     | Some clk ->
-        let _ = gen_dff_en ctx clk ctx.current_reset None d_wire q_wire width 0 in
+        let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None d_wire q_wire width 0 in
         ()
     | None ->
         add_warning "Sequential assignment without clock context"
   end else begin
-    (* Only create assign if RHS is not the same as LHS (avoid assign x = x) *)
+    (* Only create assign if RHS is not the same as LHS *)
     if rhs_wire <> lhs_name then
       ctx.instances := 
         (Printf.sprintf "  assign %s = %s;" lhs_name rhs_wire) :: !(ctx.instances)
@@ -644,10 +748,10 @@ let rec structural_if ctx condition then_stmt else_stmt =
           
           (match ctx.current_clock, enable_sig with
           | Some clk, Some en ->
-              let _ = gen_dff_en ctx clk ctx.current_reset (Some en) rhs_wire lhs_name width 0 in
+              let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset (Some en) rhs_wire lhs_name width 0 in
               ()
           | Some clk, None ->
-              let _ = gen_dff_en ctx clk ctx.current_reset None rhs_wire lhs_name width 0 in
+              let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
               ()
           | None, _ ->
               add_warning "Enable condition in sequential block without clock")
@@ -666,7 +770,7 @@ let rec structural_if ctx condition then_stmt else_stmt =
                 in
                 (match ctx.current_clock, enable_sig with
                 | Some clk, Some en ->
-                    let _ = gen_dff_en ctx clk ctx.current_reset (Some en) rhs_wire lhs_name width 0 in
+                    let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset (Some en) rhs_wire lhs_name width 0 in
                     ()
                 | _ -> ())
             | _ -> ()
@@ -729,7 +833,7 @@ and structural_if_as_mux ctx condition then_stmt else_stmt =
     
     if not ctx.in_sequential then begin
       if expr_depends_on ctx lhs_name then_rhs then
-        failwith (Printf.sprintf "Combinational loop: %sdepends on itself in then branch" lhs_name);
+        failwith (Printf.sprintf "Combinational loop: %s depends on itself in then branch" lhs_name);
       if expr_depends_on ctx lhs_name else_rhs then
         failwith (Printf.sprintf "Combinational loop: %s depends on itself in else branch" lhs_name)
     end;
@@ -833,7 +937,7 @@ let structural_latch ctx stmts =
     | If { condition; _ } :: _ ->
         (match condition with
         | VarRef { name; _ } -> Some name
-        | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ } } -> Some name
+        | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ }; _ } -> Some name
         | _ -> None)
     | _ -> None
   in
@@ -930,31 +1034,41 @@ let rec structural_stmt ctx stmt =
       
       (match block_type with
       | Unsynthesizable reason ->
-          add_warning ("ERROR: Unsynthesizable always block: " ^ reason);
-          failwith ("Cannot convert to structural: " ^ reason)
+          add_warning ("Unsynthesizable always block: " ^ reason);
+          ctx.instances := 
+            (Printf.sprintf "  // UNSYNTHESIZABLE: %s" reason) :: !(ctx.instances)
       
-      | Sequential { clock; clock_edge = _; reset } ->
-          if not (List.for_all (validate_hardware_stmt ctx) stmts) then
-            failwith "Sequential block contains unsynthesizable statements";
-          
-          let old_sequential = ctx.in_sequential in
-          let old_clock = ctx.current_clock in
-          let old_reset = ctx.current_reset in
-          
-          ctx.in_sequential <- true;
-          ctx.current_clock <- Some clock;
-          ctx.current_reset <- (match reset with Some (r, _) -> Some r | None -> None);
-          
-          List.iter (structural_stmt ctx) stmts;
-          
-          ctx.in_sequential <- old_sequential;
-          ctx.current_clock <- old_clock;
-          ctx.current_reset <- old_reset
+      | Sequential { clock; clock_edge; reset } ->
+          if not (List.for_all (validate_hardware_stmt ctx) stmts) then begin
+            add_warning "Sequential block contains unsynthesizable statements";
+            ctx.instances := 
+              (Printf.sprintf "  // UNSYNTHESIZABLE: sequential block with invalid statements") :: !(ctx.instances)
+          end else begin
+            let old_sequential = ctx.in_sequential in
+            let old_clock = ctx.current_clock in
+            let old_clock_edge = ctx.current_clock_edge in
+            let old_reset = ctx.current_reset in
+            
+            ctx.in_sequential <- true;
+            ctx.current_clock <- Some clock;
+            ctx.current_clock_edge <- Some clock_edge;
+            ctx.current_reset <- (match reset with Some (r, _) -> Some r | None -> None);
+            
+            List.iter (structural_stmt ctx) stmts;
+            
+            ctx.in_sequential <- old_sequential;
+            ctx.current_clock <- old_clock;
+            ctx.current_clock_edge <- old_clock_edge;
+            ctx.current_reset <- old_reset
+          end
       
       | Combinational ->
-          if not (List.for_all (validate_hardware_stmt ctx) stmts) then
-            failwith "Combinational block contains unsynthesizable statements";
-          List.iter (structural_stmt ctx) stmts
+          if not (List.for_all (validate_hardware_stmt ctx) stmts) then begin
+            add_warning "Combinational block contains unsynthesizable statements";
+            ctx.instances := 
+              (Printf.sprintf "  // UNSYNTHESIZABLE: combinational block with invalid statements") :: !(ctx.instances)
+          end else
+            List.iter (structural_stmt ctx) stmts
       
       | Latch ->
           add_warning "Converting always_latch block - ensure this is intentional";
@@ -1126,7 +1240,6 @@ let structural_module name stmts packages =
         (* Handle array declarations *)
         (match dtype_ref with
         | Some (ArrayType { base; range }) ->
-            (* This is for UNPACKED arrays like: logic [7:0] mem [0:15] *)
             let elem_type = match base with
               | RefType { name; _ } -> name
               | BasicType { keyword; _ } -> keyword
@@ -1139,11 +1252,10 @@ let structural_module name stmts packages =
             in
             Some (Printf.sprintf "  %s%s %s [%s];" elem_type elem_width name range)
         | _ ->
-            (* Regular signal - this is the PACKED case: logic [3:0] signal *)
             Some (Printf.sprintf "  %s%s %s;" base_type width_str name))
     | _ -> None
   ) all_vars in
-      
+  
   (* Build module string *)
   let param_str = if params = [] then "" 
     else "\n#(\n" ^ String.concat ",\n" params ^ "\n)" in

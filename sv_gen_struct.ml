@@ -592,6 +592,8 @@ let structural_assign ctx lhs rhs is_sequential =
     | Sel _ | ArraySel _ -> structural_expr ctx lhs
     | _ -> "unknown"
   in
+  
+  (* Check if RHS is already a wire from a previous operation *)
   let rhs_wire = structural_expr ctx rhs in
   
   if is_sequential then begin
@@ -608,8 +610,10 @@ let structural_assign ctx lhs rhs is_sequential =
     | None ->
         add_warning "Sequential assignment without clock context"
   end else begin
-    ctx.instances := 
-      (Printf.sprintf "  assign %s = %s;" lhs_name rhs_wire) :: !(ctx.instances)
+    (* Only create assign if RHS is not the same as LHS (avoid assign x = x) *)
+    if rhs_wire <> lhs_name then
+      ctx.instances := 
+        (Printf.sprintf "  assign %s = %s;" lhs_name rhs_wire) :: !(ctx.instances)
   end
 
 (* Convert if statement to structural muxes *)
@@ -1122,6 +1126,7 @@ let structural_module name stmts packages =
         (* Handle array declarations *)
         (match dtype_ref with
         | Some (ArrayType { base; range }) ->
+            (* This is for UNPACKED arrays like: logic [7:0] mem [0:15] *)
             let elem_type = match base with
               | RefType { name; _ } -> name
               | BasicType { keyword; _ } -> keyword
@@ -1134,10 +1139,11 @@ let structural_module name stmts packages =
             in
             Some (Printf.sprintf "  %s%s %s [%s];" elem_type elem_width name range)
         | _ ->
+            (* Regular signal - this is the PACKED case: logic [3:0] signal *)
             Some (Printf.sprintf "  %s%s %s;" base_type width_str name))
     | _ -> None
   ) all_vars in
-  
+      
   (* Build module string *)
   let param_str = if params = [] then "" 
     else "\n#(\n" ^ String.concat ",\n" params ^ "\n)" in

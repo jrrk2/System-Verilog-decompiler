@@ -45,10 +45,21 @@ let new_version ctx var_name dtype_ref =
   Hashtbl.replace ctx.versions var_name next;
   let new_name = Printf.sprintf "%s_%d" var_name next in
   
-  (* Add variable declaration *)
+  (* Add variable declaration with CORRECT dtype *)
+  (* If dtype_ref is ArrayType, it represents the signal's width, not an unpacked array *)
+  let corrected_dtype = match dtype_ref with
+    | Some (ArrayType { base; range }) ->
+        (* This is actually a packed vector like logic [3:0] *)
+        Some (BasicType { keyword = (match base with 
+          | BasicType { keyword; _ } -> keyword 
+          | _ -> "logic"); 
+          range = Some range })
+    | _ -> dtype_ref
+  in
+  
   let var_decl = Var {
     name = new_name;
-    dtype_ref;
+    dtype_ref = corrected_dtype;
     var_type = "VAR";
     direction = "NONE";
     value = None;

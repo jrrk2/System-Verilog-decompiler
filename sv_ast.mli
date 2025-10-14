@@ -164,14 +164,29 @@ and sv_node =
       expr: sv_node;
       items: case_item list;
     }
-  | While of {
+  | For' of {
       condition: sv_node;
       stmts: sv_node list;
       incs: sv_node list;
     }
+  | For of {
+      name: string;
+      dtype_ref: sv_type option;
+      lhs: sv_node;
+      rhs: sv_node;
+      condition: sv_node;
+      stmts: sv_node list;
+      incs: sv_node list;
+    }
+  | VarRef' of {
+      name: string;
+      access: string;
+      dtype: string;
+    }
   | VarRef of {
       name: string;
       access: string;
+      dtype_ref: sv_type option;
     }
   | VarXRef of {
       name: string;

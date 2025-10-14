@@ -643,7 +643,7 @@ and structural_if_as_mux ctx condition then_stmt else_stmt =
       with Not_found ->
         (* NO ELSE BRANCH - different handling for sequential vs combinational *)
         if ctx.in_sequential then
-          VarRef { name = lhs_name; access = "RD" }  (* OK in sequential - keeps value *)
+          VarRef { name = lhs_name; access = "RD"; dtype_ref=None }  (* OK in sequential - keeps value *)
         else begin
           (* In combinational, use default value to avoid loop *)
           add_warning (Printf.sprintf "Incomplete if for %s - using default 0" lhs_name);
@@ -671,7 +671,7 @@ and structural_if_as_mux ctx condition then_stmt else_stmt =
     let _ = gen_mux ctx cond_wire else_wire then_wire result_wire width in
     
     (* Assign result to lhs *)
-    structural_assign ctx lhs (VarRef { name = result_wire; access = "RD" }) ctx.in_sequential
+    structural_assign ctx lhs (VarRef { name = result_wire; access = "RD"; dtype_ref = None }) ctx.in_sequential
   in
   
   List.iter process_var then_assigns
@@ -798,7 +798,7 @@ and structural_stmt ctx stmt =
   | Case { expr; items } ->
       structural_case ctx expr items
   
-  | While { condition; stmts; incs } ->
+  | For' { condition; stmts; incs } ->
       flatten_loop ctx condition stmts incs 64
   
   | Begin { stmts; _ } ->
@@ -856,7 +856,7 @@ and structural_stmt ctx stmt =
 (* Inline function into expression *)
 and inline_function ctx func_def args =
   add_warning (Printf.sprintf "Inlining function (not yet implemented)");
-  VarRef { name = "/* inlined_func */"; access = "RD" }
+  VarRef { name = "/* inlined_func */"; access = "RD"; dtype_ref = None }
 
 (* Inline task into statements *)
 and inline_task ctx task_def args =
@@ -883,7 +883,7 @@ and validate_hardware_stmt ctx = function
         List.for_all (validate_hardware_stmt ctx) statements
       ) items
   | Begin { stmts; _ } -> List.for_all (validate_hardware_stmt ctx) stmts
-  | While _ -> false  (* Not synthesizable *)
+  | For' _ -> false  (* Not synthesizable *)
   | EventCtrl _ | Delay _ | Initial _ | InitialStatic _ | Final _ -> false
   | Display _ | Finish | Stop _ -> false
   | _ -> true
@@ -925,7 +925,7 @@ and validate_hardware_expr ctx = function
   | Case { expr; items } ->
       structural_case ctx expr items; true
   
-  | While { condition; stmts; incs } ->
+  | For' { condition; stmts; incs } ->
       flatten_loop ctx condition stmts incs 64; true
   
   | Begin { stmts; _ } ->

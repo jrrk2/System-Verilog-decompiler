@@ -300,16 +300,17 @@ let rec parse_json attr json =
       let conditions = json |> member "condsp" |> to_list |> List.map (parse' attr name) in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       CaseItem { conditions; stmts }
-(*      *)
+
   | "WHILE" ->
       let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let incs = json |> member "incsp" |> to_list |> List.map (parse' attr name) in
-      While { condition; stmts; incs }
-(* *)      
+      For' { condition; stmts; incs }
+
   | "VARREF" ->
+      let dtype = json |> member "dtypep" |> to_string in
       let access = json |> member "access" |> to_string_option |> Option.value ~default:"RD" in
-      VarRef { name; access }
+      VarRef' { name; access; dtype }
       
   | "VARXREF" ->
       let access = json |> member "access" |> to_string_option |> Option.value ~default:"RD" in
@@ -536,42 +537,41 @@ let othrw = ref None
 let othrwtyp = ref None
 
 let rec rw attr = function
-| Netlist lst -> Netlist (List.map (rw attr) lst)
-| Module {name; stmts} -> Module {name; stmts=List.map (rw attr) stmts}
+| Netlist lst -> Netlist (rwlst attr lst)
+| Module {name; stmts} -> Module {name; stmts=rwlst attr stmts}
 | Var' {name; dtype_ref; var_type; direction; value; dtype_name; is_param} ->
   let typ = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) in
   Var {name; dtype_ref=typ; var_type; direction; value; dtype_name; is_param}
 | Cell' {name; modp_addr; pins } ->
-  Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=List.map (rw attr) pins}
+  Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=rwlst attr pins}
 | Pin {name; expr} -> Pin {name; expr=rwopt attr expr}
 | InsideRange {lhs; rhs} -> InsideRange {lhs=rw attr lhs; rhs=rw attr rhs}
 | Assign {lhs; rhs; is_blocking} -> Assign {lhs=rw attr lhs; rhs=rw attr rhs; is_blocking}
 | AssignW {lhs; rhs} -> AssignW {lhs=rw attr lhs; rhs=rw attr rhs}
-| VarRef {name; access} as v -> v
 | VarXRef {name; access; dotted} as v -> v
-| Always {always; senses; stmts} -> Always {always; senses=List.map (rw attr) senses; stmts=List.map (rw attr) stmts};
-| SenTree lst -> SenTree (List.map (rw attr) lst)
+| Always {always; senses; stmts} -> Always {always; senses=rwlst attr senses; stmts=rwlst attr stmts};
+| SenTree lst -> SenTree (rwlst attr lst)
 | SenItem {edge_str; signal} -> SenItem {edge_str; signal=rw attr signal}
 | BinaryOp {op; lhs; rhs} -> BinaryOp {op; lhs=rw attr lhs; rhs=rw attr rhs}
 | Interface {name; params; stmts} ->
-  Interface {name; params=List.map (rw attr) params; stmts=List.map (rw attr) stmts}
-| Modport { name; vars } -> Modport { name; vars=List.map (rw attr) vars }
+  Interface {name; params=rwlst attr params; stmts=rwlst attr stmts}
+| Modport { name; vars } -> Modport { name; vars=rwlst attr vars }
 | ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
 | Const' { name; dtype_ref } ->
   Const { name; dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
-| Begin { name; stmts; is_generate } -> Begin { name; stmts=List.map (rw attr) stmts; is_generate }
+| Begin { name; stmts; is_generate } -> Begin { name; stmts=rwlst attr stmts; is_generate }
 | Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
 | Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
-| EventCtrl { sense; stmts} -> EventCtrl {sense = List.map (rw attr) sense; stmts = List.map (rw attr) stmts}
-| InitArray { inits} -> InitArray {inits = List.map (rw attr) inits}
-| Initial { suspend; stmts} -> Initial {suspend; stmts = List.map (rw attr) stmts}
-| InitialStatic { suspend; process; stmts} -> InitialStatic {suspend; process; stmts = List.map (rw attr) stmts}
-| Final { suspend; process; stmts} -> Final {suspend; process; stmts = List.map (rw attr) stmts}
+| EventCtrl { sense; stmts} -> EventCtrl {sense = rwlst attr sense; stmts = rwlst attr stmts}
+| InitArray { inits} -> InitArray {inits = rwlst attr inits}
+| Initial { suspend; stmts} -> Initial {suspend; stmts = rwlst attr stmts}
+| InitialStatic { suspend; process; stmts} -> InitialStatic {suspend; process; stmts = rwlst attr stmts}
+| Final { suspend; process; stmts} -> Final {suspend; process; stmts = rwlst attr stmts}
 | Finish -> Finish
-| Delay { cycle; lhs; stmts} -> Delay {cycle; lhs = rw attr lhs; stmts = List.map (rw attr) stmts}
-| While { condition; stmts; incs} -> While {condition = rw attr condition;
-stmts = List.map (rw attr) stmts;
-incs = List.map (rw attr) incs;}
+| Delay { cycle; lhs; stmts} -> Delay {cycle; lhs = rw attr lhs; stmts = rwlst attr stmts}
+| For' { condition; stmts; incs} -> For' {condition = rw attr condition;
+stmts = rwlst attr stmts;
+incs = rwlst attr incs;}
 | UnaryOp {op; operand} -> UnaryOp { op; operand = rw attr operand; }
 | Cond {condition; then_val; else_val } -> Cond {condition = rw attr condition;
     then_val = rw attr then_val;
@@ -580,53 +580,55 @@ incs = List.map (rw attr) incs;}
     then_stmt = rw attr then_stmt;
     else_stmt = match else_stmt with Some stmt -> Some (rw attr stmt) | None -> None} 
 | ArraySel { expr; index } -> ArraySel { expr = rw attr expr; index = rw attr index }
-| FuncRef { name; args } -> FuncRef { name; args = List.map (rw attr) args }
-| TaskRef { name; args } -> TaskRef { name; args = List.map (rw attr) args }
-| Concat { parts } -> Concat { parts = List.map (rw attr) parts }
-| Display { fmt; file } -> Display { fmt=List.map (rw attr) fmt; file = List.map (rw attr) file }
-| Sformat { fmt; lhs } -> Sformat { fmt=List.map (rw attr) fmt; lhs = List.map (rw attr) lhs }
-| Sformatp { expr; scope } -> Sformatp { expr=List.map (rw attr) expr; scope = List.map (rw attr) scope }
+| FuncRef { name; args } -> FuncRef { name; args = rwlst attr args }
+| TaskRef { name; args } -> TaskRef { name; args = rwlst attr args }
+| Concat { parts } -> Concat { parts = rwlst attr parts }
+| Display { fmt; file } -> Display { fmt=rwlst attr fmt; file = rwlst attr file }
+| Sformat { fmt; lhs } -> Sformat { fmt=rwlst attr fmt; lhs = rwlst attr lhs }
+| Sformatp { expr; scope } -> Sformatp { expr=rwlst attr expr; scope = rwlst attr scope }
 | ScopeName { dtype } -> ScopeName { dtype }
 | Time { dtype } -> Time { dtype }
 | Text { text } -> Text { text }
-| Sampled { dtype; expr } -> Sampled { dtype; expr = List.map (rw attr) expr }
-| Cexpr { dtype; expr } -> Cexpr { dtype; expr = List.map (rw attr) expr }
+| Sampled { dtype; expr } -> Sampled { dtype; expr = rwlst attr expr }
+| Cexpr { dtype; expr } -> Cexpr { dtype; expr = rwlst attr expr }
 | StmtExpr { expr } -> StmtExpr { expr = rw attr expr }
-| Package { name; stmts } -> Package { name; stmts = List.map (rw attr) stmts }
+| Package { name; stmts } -> Package { name; stmts = rwlst attr stmts }
 | Typedef' { name; dtype_ref } -> Typedef { name;
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref) }
 | Typedef { name; dtype_ref } -> Typedef { name; dtype_ref } 
+| VarRef' { name; access; dtype } -> VarRef {
+    name; access; dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
 | Itord' { dtype; lhs } -> Itord {
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
-    lhs = List.map (rw attr) lhs }
+    lhs = rwlst attr lhs }
 | Itord { dtype_ref; lhs } -> Itord { dtype_ref; lhs } 
 | CvtPackString' { dtype; lhs } -> CvtPackString {
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
-    lhs = List.map (rw attr) lhs }
+    lhs = rwlst attr lhs }
 | CvtPackString { dtype_ref; lhs } -> CvtPackString { dtype_ref; lhs } 
 | Fopen' { dtype; filename; mode } -> Fopen {
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
-    filename = List.map (rw attr) filename;
-    mode = List.map (rw attr) mode }
+    filename = rwlst attr filename;
+    mode = rwlst attr mode }
 | Fopen { dtype_ref; filename; mode } -> Fopen { dtype_ref; filename; mode } 
 | Fclose { file } -> Fclose {
-    file = List.map (rw attr) file }
+    file = rwlst attr file }
 | ValuePlusArgs' { dtype; search; out } -> ValuePlusArgs {
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
-    search = List.map (rw attr) search;
-    out = List.map (rw attr) out;
+    search = rwlst attr search;
+    out = rwlst attr out;
  }
 | ValuePlusArgs _ as v -> v
 | TestPlusArgs' { dtype; search } -> TestPlusArgs {
     dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
-    search = List.map (rw attr) search;
+    search = rwlst attr search;
  }
 | TestPlusArgs _ as v -> v
 | Func' { name; dtype_ref; stmts; vars } -> Func {
       name;
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
-      stmts = List.map (rw attr) stmts ;
-      vars = List.map (rw attr) vars }
+      stmts = rwlst attr stmts ;
+      vars = rwlst attr vars }
 | Func {
       name;
       dtype_ref;
@@ -634,10 +636,10 @@ incs = List.map (rw attr) incs;}
       vars } -> Func {
       name;
       dtype_ref = rwtyp' attr dtype_ref;
-      stmts = List.map (rw attr) stmts;
-      vars = List.map (rw attr) vars }
+      stmts = rwlst attr stmts;
+      vars = rwlst attr vars }
 | JumpBlock { stmt } -> JumpBlock {
-      stmt = List.map (rw attr) stmt }
+      stmt = rwlst attr stmt }
 | JumpGo' { label } -> JumpGo {
       label=rwtyp' attr (Hashtbl.find_opt attr.type_table label) }
 | JumpGo { label } -> JumpGo { label }
@@ -648,8 +650,8 @@ incs = List.map (rw attr) incs;}
 | Task' { name; dtype_ref; stmts; vars } -> Task {
       name;
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype_ref);
-      stmts = List.map (rw attr) stmts ;
-      vars = List.map (rw attr) vars }
+      stmts = rwlst attr stmts ;
+      vars = rwlst attr vars }
 | Task {
       name;
       dtype_ref;
@@ -657,37 +659,39 @@ incs = List.map (rw attr) incs;}
       vars } -> Task {
       name;
       dtype_ref = rwtyp' attr dtype_ref;
-      stmts = List.map (rw attr) stmts;
-      vars = List.map (rw attr) vars }
+      stmts = rwlst attr stmts;
+      vars = rwlst attr vars }
 | ConsPack' { dtype; members } -> ConsPack {
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
-      members = List.map (rw attr) members }
-| ConsPack { dtype_ref; members } -> ConsPack { dtype_ref; members = List.map (rw attr) members }
+      members = rwlst attr members }
+| ConsPack { dtype_ref; members } -> ConsPack { dtype_ref; members = rwlst attr members }
 | ConsPackMember' { dtype; rhs } -> ConsPackMember {
       dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
       rhs = rw attr rhs }
 | ConsPackMember { dtype_ref; rhs } -> ConsPackMember { dtype_ref; rhs = rw attr rhs }
 | CaseItem { conditions; stmts } -> CaseItem {
-      conditions = List.map (rw attr) conditions;
-      stmts = List.map (rw attr) stmts }
+      conditions = rwlst attr conditions;
+      stmts = rwlst attr stmts }
 | InitItem { value } -> InitItem {
-      value = List.map (rw attr) value }
+      value = rwlst attr value }
 | CMethodHard' { dtype; from; pins } -> CMethodHard {
       dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
       from=rw attr from;
-      pins = List.map (rw attr) pins }
+      pins = rwlst attr pins }
 | Const _
 | Cell _
 | Stop _
 | Replicate _
 | CMethodHard _
+| VarRef _
+| For _
 | Var _ as skip -> skip
 | Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"
 
 and rwitm attr = function
 | { conditions; statements } -> {
-    conditions= List.map (rw attr) conditions;
-    statements = List.map (rw attr) statements }
+    conditions= rwlst attr conditions;
+    statements = rwlst attr statements }
 
 and rwopt attr = function
 | Some x -> Some (rw attr x)
@@ -728,6 +732,12 @@ and rwtyp attr = function
     ConstType { name; dtype_ref; child = List.map (rwtyp attr) child }
 | VoidType { name; resolved } -> VoidType { name; resolved }
 | oth -> othrwtyp := Some oth; failwith "othrwtyp"
+
+and rwlst attr = function
+| [] -> []
+| Var {name; dtype_ref} :: Assign {lhs = VarRef {name=lname; access = "WR"} as lhs; rhs } :: For' {condition; stmts; incs } :: tl when name=lname ->
+  For { name; dtype_ref; lhs; rhs; condition; stmts; incs } :: rwlst attr tl
+| oth :: tl -> rw attr oth :: rwlst attr tl
 
 let dbgpass1 = ref (Unknown ("",`Null))
 let dbgpass2 = ref (Unknown ("",`Null))

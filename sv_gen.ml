@@ -160,7 +160,7 @@ let fix_varxref_in_node top_level_ports iface_var_name node =
   let rec fix_node = function
     | VarXRef { name; dotted; _ } ->
         let signal_name = convert_varxref_to_signal name dotted top_level_ports in
-        VarRef { name = signal_name; access = "RD" }
+        VarRef { name = signal_name; access = "RD"; dtype_ref = None }
     | Assign { lhs; rhs; is_blocking } ->
         Assign { lhs = fix_node lhs; rhs = fix_node rhs; is_blocking }
     | BinaryOp { op; lhs; rhs } ->
@@ -458,7 +458,7 @@ let rec generate_sv node indent =
         ) items) in
       Printf.sprintf "%scase (%s)\n%s\n%sendcase" ind expr_str items_str ind
 
-  | While { condition; stmts; incs; _ } ->
+  | For' { condition; stmts; incs; _ } ->
       let cond_str = generate_sv_with_interfaces condition 0 [] |> String.trim in
       let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
       let inc_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) incs) in
@@ -918,7 +918,7 @@ and generate_top_module_with_interfaces name stmts interface_refs interfaces =
         let fixed_rhs = match rhs with
           | VarXRef { name; dotted; _ } -> 
               let signal_name = Printf.sprintf "%s_%s" dotted name in
-              VarRef { name = signal_name; access = "RD" }
+              VarRef { name = signal_name; access = "RD"; dtype_ref = None }
           | _ -> rhs
         in
         let fixed_lhs = match lhs with

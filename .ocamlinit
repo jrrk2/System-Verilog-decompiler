@@ -19,8 +19,8 @@ let tran = Hashtbl.find tranhash "Vsigned_mult.tree.json";;
 let ast = Hashtbl.find asthash "Vfunctions_tasks.tree.json";;
 let tran = Hashtbl.find tranhash "Vfunctions_tasks.tree.json";;
 *)
-let ast = Hashtbl.find asthash "Vdecompile_Vloop.tree.json";;
-let tran = Hashtbl.find tranhash "Vdecompile_Vloop.tree.json";;
+let ast = Hashtbl.find asthash "Vloop.tree.json";;
+let tran = Hashtbl.find tranhash "Vloop.tree.json";;
 (*
 let ast = Hashtbl.find asthash "Vloop.tree.json";;
 let tran = Hashtbl.find tranhash "Vloop.tree.json";;

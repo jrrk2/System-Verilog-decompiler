@@ -38,13 +38,13 @@ let scan rslt =
       
       (* 2. NEW: Transform non-synth to synth *)
       let transformed_ast = Sv_transform.transform ~verbose:true ast in
-      Hashtbl.add tranhash itm transformed_ast;
 
       (* Convert to structural with legacy converter *)
       let legacy_result, legacy_warn = Sv_gen_struct.generate_structural_with_warnings transformed_ast in
       
       (* Generate structural AST (not text) *)
       let structural_ast, warn = Sv_tran_struct.generate_structural_ast transformed_ast in
+      Hashtbl.add tranhash itm structural_ast;
 
       (* Option 1: Render to text with existing sv_gen.ml *)
       let result = Sv_gen.generate_sv structural_ast 0 in

@@ -294,6 +294,28 @@ let parse_verilog_const s =
     Printf.eprintf "Error: Could not parse constant '%s': %s\n" s (Printexc.to_string e);
     0
 
+let dbgstmts = ref []
+
+let reorder_module_stmts stmts =
+  (* Partition by statement type *)
+  let (ports, non_ports) = List.partition (function
+    | Var { var_type = "PORT"; _ } -> true
+    | _ -> false
+  ) stmts in
+  
+  let (params, rest1) = List.partition (function
+    | Var { var_type = "GPARAM"; _ } -> true
+    | _ -> false
+  ) non_ports in
+  
+  let (vars, instances_and_assigns) = List.partition (function
+    | Var { var_type = "VAR"; _ } -> true
+    | _ -> false
+  ) rest1 in
+  
+  (* Return in proper order: params, ports, vars, then instances/assigns *)
+  params @ ports @ vars @ instances_and_assigns
+
 let rec generate_sv node indent =
   let ind = String.make (indent * 2) ' ' in
   match node with
@@ -824,22 +846,22 @@ and generate_sv_indent indent node = generate_sv node indent
 
 and generate_sv_with_interfaces node indent interfaces =
   match node with
-  | Module { name; stmts; _ } ->
-      let interface_refs = extract_interface_refs stmts in
-      let has_regular_ports = List.exists (function | Var { var_type = "PORT"; _ } -> true | _ -> false) stmts in
+  | Module { name; stmts; _ } -> let stmts' = reorder_module_stmts stmts in
+      dbgstmts := stmts';
+      let interface_refs = extract_interface_refs stmts' in
+      let has_regular_ports = List.exists (function | Var { var_type = "PORT"; _ } -> true | _ -> false) stmts' in
       
       if has_regular_ports then
-        generate_top_module_with_interfaces indent name stmts interface_refs interfaces
+        generate_top_module_with_interfaces indent name stmts' interface_refs interfaces
       else if interface_refs <> [] then
-        generate_interface_module_with_interfaces name stmts interface_refs interfaces
+        generate_interface_module_with_interfaces name stmts' interface_refs interfaces
       else
-        generate_regular_module name stmts []
+        generate_regular_module name stmts' []
   
   | _ -> generate_sv node indent
 
 and generate_sv_with_interfaces_indent indent interfaces node = 
   generate_sv_with_interfaces node indent interfaces
-
 and generate_top_module_with_interfaces indent name stmts interface_refs interfaces =
   let ind = String.make (indent * 2) ' ' in
   if !debug then Printf.printf "DEBUG: Generating top module '%s' with %d interface refs\n" name (List.length interface_refs);
@@ -859,7 +881,6 @@ and generate_top_module_with_interfaces indent name stmts interface_refs interfa
       | Var { var_type = "IFACEREF"; _ } -> (ps, ports, cells, gens, others)
       | Cell _ as c -> (ps, ports, c :: cells, gens, others)
       | Always { always; senses; stmts = astmts; _ } as a ->
-          (* Filter out assertion always blocks *)
           let has_display = List.exists (function
             | Display _ -> true
             | If { condition = Cexpr _; _ } -> true
@@ -868,7 +889,6 @@ and generate_top_module_with_interfaces indent name stmts interface_refs interfa
           if has_display then (ps, ports, cells, gens, others)
           else (ps, ports, cells, gens, a :: others)
       | Begin { name = bname; is_generate = true; _ } as b ->
-          (* Keep all generate blocks together *)
           (ps, ports, cells, b :: gens, others)
       | _ -> (ps, ports, cells, gens, stmt :: others)
     ) ([], [], [], [], []) stmts in
@@ -891,7 +911,7 @@ and generate_top_module_with_interfaces indent name stmts interface_refs interfa
     ""
   in
 
-  (* Keep ports in original order - FIXED *)
+  (* Keep ports in original order *)
   let port_decls = List.map (fun v -> generate_sv_with_interfaces v 1 interfaces) (List.rev regular_ports) in
   
   let signal_decls = List.fold_left (fun acc (var_name, iface_name, _, _) ->
@@ -903,42 +923,51 @@ and generate_top_module_with_interfaces indent name stmts interface_refs interfa
   let cell_stmts = List.map (fun cell ->
     match cell with
     | Cell { name; modp_addr; pins; _ } ->
-	(match modp_addr with
-	| Some (Module { name = module_name; stmts = mod_stmts; _ }) ->
-	    (* Extract parameters from stmts *)
-	    let params = List.filter_map (function
-	      | Var { name = pname; value = Some v; var_type = "GPARAM"; _ } ->
-		  let val_str = generate_sv_with_interfaces v 0 [] |> String.trim in
-		  Some (Printf.sprintf ".%s(%s)" pname val_str)
-	      | _ -> None
-	    ) mod_stmts in
+        (match modp_addr with
+        | Some (Module { name = module_name; stmts = mod_stmts; _ }) ->
+            let params = List.filter_map (function
+              | Var { name = pname; value = Some v; var_type = "GPARAM"; _ } ->
+                  let val_str = generate_sv_with_interfaces v 0 [] |> String.trim in
+                  Some (Printf.sprintf ".%s(%s)" pname val_str)
+              | _ -> None
+            ) mod_stmts in
 
-	    let param_str = if params = [] then "" 
-	      else " #(" ^ String.concat ", " params ^ ")" in
+            let param_str = if params = [] then "" 
+              else " #(" ^ String.concat ", " params ^ ")" in
 
-	    (* Generate port connections *)
-	    let connections = List.filter_map (function
-	      | Pin { name = pname; expr = Some e } ->
-		  let expr_str = generate_sv_with_interfaces e 0 [] |> String.trim in
-		  Some (Printf.sprintf ".%s(%s)" pname expr_str)
-	      | _ -> None
-	    ) pins in
+            let connections = List.filter_map (function
+              | Pin { name = pname; expr = Some e } ->
+                  let expr_str = generate_sv_with_interfaces e 0 [] |> String.trim in
+                  Some (Printf.sprintf ".%s(%s)" pname expr_str)
+              | _ -> None
+            ) pins in
 
-	    if List.length connections > 0 then
-	      Printf.sprintf "%s%s%s %s (\n%s%s\n%s);" 
-		ind module_name param_str name
-		(String.make ((indent + 1) * 2) ' ')
-		(String.concat (",\n" ^ String.make ((indent + 1) * 2) ' ') connections)
-		ind
-	    else
-	      Printf.sprintf "%s%s%s %s ();" ind module_name param_str name
-	      | _ -> Printf.sprintf "%s// Unknown cell %s" ind name)
+            if List.length connections > 0 then
+              Printf.sprintf "%s%s%s %s (\n%s%s\n%s);" 
+                ind module_name param_str name
+                (String.make ((indent + 1) * 2) ' ')
+                (String.concat (",\n" ^ String.make ((indent + 1) * 2) ' ') connections)
+                ind
+            else
+              Printf.sprintf "%s%s%s %s ();" ind module_name param_str name
+        | _ -> Printf.sprintf "%s// Unknown cell %s" ind name)
     | _ -> ""
   ) cells in
 
-  (* Process generate blocks - keep parent and children together *)
   let gen_stmts = List.map (generate_sv_with_interfaces_indent 1 interfaces) (List.rev gen_blocks) in
 
+  (* FIXED: Partition other_stmts into vars and non-vars *)
+  let (var_stmts, non_var_stmts) = List.partition (function
+    | Var { var_type = "VAR"; _ } -> true
+    | _ -> false
+  ) other_stmts in
+  
+  (* Render variable declarations *)
+  let var_decls = List.map (fun stmt ->
+    generate_sv_with_interfaces stmt 1 interfaces
+  ) var_stmts in
+  
+  (* Render assignments and other statements *)
   let other_assigns = List.map (fun stmt ->
     match stmt with
     | AssignW { lhs; rhs } ->
@@ -954,11 +983,16 @@ and generate_top_module_with_interfaces indent name stmts interface_refs interfa
         in
         generate_sv_with_interfaces (AssignW { lhs = fixed_lhs; rhs = fixed_rhs }) 1 interfaces
     | _ -> generate_sv_with_interfaces stmt 1 interfaces
-  ) other_stmts in
+  ) non_var_stmts in
 
   let port_str = String.concat ",\n" port_decls in
-  let body_parts = signal_decls @ cell_stmts @ gen_stmts @ other_assigns in
-  let body = String.concat "\n" (List.filter (fun s -> s <> "") body_parts) in
+  
+  (* FIXED: Render in correct order: signal_decls, var_decls, then instances/assigns *)
+  let body_parts = [
+    String.concat "\n" (List.filter (fun s -> s <> "") (signal_decls @ var_decls));
+    String.concat "\n" (List.filter (fun s -> s <> "") (cell_stmts @ gen_stmts @ other_assigns))
+  ] in
+  let body = String.concat "\n\n" (List.filter (fun s -> s <> "") body_parts) in
 
   Printf.sprintf "module %s%s (\n%s\n);\n%s\nendmodule" name param_str port_str body
 

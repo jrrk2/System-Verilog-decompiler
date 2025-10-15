@@ -863,7 +863,6 @@ and generate_sv_with_interfaces node indent interfaces =
 and generate_sv_with_interfaces_indent indent interfaces node = 
   generate_sv_with_interfaces node indent interfaces
 and generate_top_module_with_interfaces indent name stmts interface_refs interfaces =
-  let ind = String.make (indent * 2) ' ' in
   if !debug then Printf.printf "DEBUG: Generating top module '%s' with %d interface refs\n" name (List.length interface_refs);
   
   let top_level_ports = List.fold_left (fun acc stmt ->
@@ -943,14 +942,12 @@ and generate_top_module_with_interfaces indent name stmts interface_refs interfa
             ) pins in
 
             if List.length connections > 0 then
-              Printf.sprintf "%s%s%s %s (\n%s%s\n%s);" 
-                ind module_name param_str name
-                (String.make ((indent + 1) * 2) ' ')
-                (String.concat (",\n" ^ String.make ((indent + 1) * 2) ' ') connections)
-                ind
+              Printf.sprintf "  %s%s %s (\n    %s\n  );" 
+                module_name param_str name
+                (String.concat ",\n    " connections)
             else
-              Printf.sprintf "%s%s%s %s ();" ind module_name param_str name
-        | _ -> Printf.sprintf "%s// Unknown cell %s" ind name)
+              Printf.sprintf "  %s%s %s ();" module_name param_str name
+        | _ -> Printf.sprintf "  // Unknown cell %s" name)
     | _ -> ""
   ) cells in
 
